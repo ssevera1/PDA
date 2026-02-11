@@ -1,6 +1,8 @@
 .env
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 venv/
 .venv/
 *.egg-info/
@@ -8,3 +10,6 @@ dist/
 build/
 .idea/
 .vscode/
+.pytest_cache/
+*.egg
+*.whl
