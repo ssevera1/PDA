@@ -1,14 +1,9 @@
 from __future__ import annotations
 
-import anthropic
-
 from config import get_settings
 from store.conversations import CallSession
 from agent.prompts import system_prompt, SUMMARY_PROMPT
-
-
-def _client() -> anthropic.Anthropic:
-    return anthropic.Anthropic(api_key=get_settings().anthropic_api_key)
+from agent.llm import get_provider
 
 
 async def respond(session: CallSession, caller_input: str) -> str:
@@ -16,15 +11,12 @@ async def respond(session: CallSession, caller_input: str) -> str:
     settings = get_settings()
     session.add_caller_message(caller_input)
 
-    client = _client()
-    response = client.messages.create(
-        model="claude-sonnet-4-5-20250929",
-        max_tokens=300,
+    reply = get_provider().complete(
         system=system_prompt(settings.agent_name, settings.owner_name),
         messages=session.messages,
+        max_tokens=300,
     )
 
-    reply = response.content[0].text
     session.add_agent_message(reply)
 
     # Check if agent wants to escalate
@@ -38,7 +30,6 @@ async def generate_greeting(session: CallSession) -> str:
     """Generate the initial greeting for a new call."""
     settings = get_settings()
 
-    client = _client()
     greeting_messages = [
         {
             "role": "user",
@@ -51,14 +42,12 @@ async def generate_greeting(session: CallSession) -> str:
         }
     ]
 
-    response = client.messages.create(
-        model="claude-sonnet-4-5-20250929",
-        max_tokens=150,
+    greeting = get_provider().complete(
         system=system_prompt(settings.agent_name, settings.owner_name),
         messages=greeting_messages,
+        max_tokens=150,
     )
 
-    greeting = response.content[0].text
     # Store the greeting exchange in session history
     session.messages.extend(greeting_messages)
     session.add_agent_message(greeting)
@@ -72,10 +61,7 @@ async def summarize_call(session: CallSession) -> str:
         role = "Caller" if msg["role"] == "user" else "Agent"
         conversation_text += f"{role}: {msg['content']}\n\n"
 
-    client = _client()
-    response = client.messages.create(
-        model="claude-sonnet-4-5-20250929",
-        max_tokens=500,
+    summary = get_provider().complete(
         system=SUMMARY_PROMPT,
         messages=[
             {
@@ -83,8 +69,8 @@ async def summarize_call(session: CallSession) -> str:
                 "content": f"Here is the call transcript:\n\n{conversation_text}",
             }
         ],
+        max_tokens=500,
     )
 
-    summary = response.content[0].text
     session.summary = summary
     return summary

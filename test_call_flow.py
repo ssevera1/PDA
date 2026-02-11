@@ -1,8 +1,8 @@
 """
 End-to-end integration test — simulates a complete phone call flow.
 
-Mocks: Claude API, Telegram API, Twilio signature validation.
-Tests: Incoming call → greeting → multi-turn conversation → call end → summary notification.
+Mocks: LLM provider, Telegram API, Twilio signature validation.
+Tests: Incoming call -> greeting -> multi-turn conversation -> call end -> summary notification.
 """
 
 import os
@@ -29,17 +29,9 @@ os.environ.update(
         "OWNER_NAME": "TestBoss",
         "BASE_URL": "https://test.ngrok-free.app",
         "ENVIRONMENT": "development",
+        "LLM_PROVIDER": "claude",
     }
 )
-
-
-def _make_claude_response(text: str):
-    """Build a mock Anthropic Messages response."""
-    mock_response = MagicMock()
-    mock_block = MagicMock()
-    mock_block.text = text
-    mock_response.content = [mock_block]
-    return mock_response
 
 
 def _parse_twiml(xml_text: str) -> ElementTree.Element:
@@ -71,6 +63,10 @@ def client():
     from config import get_settings
     get_settings.cache_clear()
 
+    # Reset the LLM provider singleton
+    from agent.llm import reset_provider
+    reset_provider()
+
     from main import app
     from store.conversations import store
 
@@ -81,6 +77,7 @@ def client():
         yield c
 
     store._sessions.clear()
+    reset_provider()
 
 
 # ===================================================================
@@ -108,34 +105,34 @@ def test_root(client):
 # ===================================================================
 # TEST 3: Full call lifecycle
 # ===================================================================
-@patch("agent.brain._client")
+@patch("agent.brain.get_provider")
 @patch("notifications.telegram.httpx.AsyncClient")
-def test_full_call_flow(mock_telegram_client, mock_anthropic_client, client):
-    """Simulate a complete call: ring → greet → 2 turns → goodbye → summary."""
+def test_full_call_flow(mock_telegram_client, mock_provider_fn, client):
+    """Simulate a complete call: ring -> greet -> 2 turns -> goodbye -> summary."""
 
-    # --- Set up Claude mock responses in order ---
-    claude = MagicMock()
-    mock_anthropic_client.return_value = claude
-    claude.messages.create.side_effect = [
+    # --- Set up LLM provider mock ---
+    provider = MagicMock()
+    mock_provider_fn.return_value = provider
+    provider.complete.side_effect = [
         # 1) Greeting
-        _make_claude_response(
+        (
             "Hi there! This is Sophie, I'm the assistant for TestBoss. "
             "How can I help you today?"
         ),
         # 2) First caller turn response
-        _make_claude_response(
+        (
             "Of course! Let me take a message for TestBoss. "
             "Could I get your name and the best number to reach you?"
         ),
         # 3) Second caller turn response — ends the call
-        _make_claude_response(
+        (
             "Got it, John. I'll make sure TestBoss gets your message "
             "about the project deadline. He'll call you back at "
             "five five five, eight seven six, five four three two. "
             "Thanks for calling! CALL_COMPLETE"
         ),
         # 4) Post-call summary
-        _make_claude_response(
+        (
             "CALLER: John\n"
             "CALLBACK: 555-876-5432\n"
             "TOPIC: Project deadline question\n"
@@ -245,9 +242,9 @@ def test_full_call_flow(mock_telegram_client, mock_anthropic_client, client):
     assert resp.status_code == 200
     assert resp.json()["ok"] is True
 
-    # Verify Claude was called 4 times (greeting + 2 turns + summary)
-    assert claude.messages.create.call_count == 4
-    print("  [PASS] Summary generated (4 Claude API calls total)")
+    # Verify provider was called 4 times (greeting + 2 turns + summary)
+    assert provider.complete.call_count == 4
+    print("  [PASS] Summary generated (4 LLM API calls total)")
     print("  [PASS] Telegram notification sent")
 
     print("\n  ========================================")
@@ -278,8 +275,8 @@ def test_empty_speech(client):
 # ===================================================================
 # TEST 5: Conversation turn limit
 # ===================================================================
-@patch("agent.brain._client")
-def test_turn_limit(mock_anthropic_client, client):
+@patch("agent.brain.get_provider")
+def test_turn_limit(mock_provider_fn, client):
     """Call should be gracefully ended after MAX_TURNS."""
     from store.conversations import store
 
@@ -300,8 +297,8 @@ def test_turn_limit(mock_anthropic_client, client):
     assert resp.status_code == 200
     root = _parse_twiml(resp.text)
     assert root.find(".//Hangup") is not None, "Should hang up after turn limit"
-    # Claude should NOT have been called — we short-circuit
-    mock_anthropic_client.return_value.messages.create.assert_not_called()
+    # Provider should NOT have been called — we short-circuit
+    mock_provider_fn.return_value.complete.assert_not_called()
     print("  [PASS] Turn limit enforced — call ended at 20 turns")
 
 

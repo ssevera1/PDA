@@ -1,6 +1,6 @@
 # PDAgent — Personal Digital Agent
 
-An AI-powered phone assistant that answers your calls, handles conversations intelligently using Claude, and sends you detailed summaries via Telegram when you're unavailable.
+An AI-powered phone assistant that answers your calls, handles conversations intelligently using Claude, Grok, or Gemini, and sends you detailed summaries via Telegram when you're unavailable.
 
 **Forward your calls → Sophie (the AI) picks up → She helps the caller → You get a full report on Telegram.**
 
@@ -65,7 +65,7 @@ An AI-powered phone assistant that answers your calls, handles conversations int
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
 | Web Framework | FastAPI (Python) | Webhook server for Twilio |
-| AI Engine | Claude Sonnet 4.5 (Anthropic) | Conversation & summarization |
+| AI Engine | Claude / Grok / Gemini (configurable) | Conversation & summarization |
 | Telephony | Twilio Programmable Voice | Call handling, STT, TTS |
 | Notifications | Telegram Bot API | Sending call reports to you |
 | TTS Voice | AWS Polly (via Twilio) | Natural-sounding speech |
@@ -76,7 +76,7 @@ An AI-powered phone assistant that answers your calls, handles conversations int
 
 - **Python 3.11+**
 - **Twilio account** (free trial works for testing)
-- **Anthropic API key** (for Claude)
+- **LLM API key** — one of: Anthropic (Claude), xAI (Grok), or Google (Gemini)
 - **Telegram account** (for receiving notifications)
 - **ngrok** (for local development) or a server with a public URL
 
@@ -99,13 +99,26 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Anthropic (Claude AI)
+### 2. LLM Provider (Choose One)
 
+#### Option A: Claude (Anthropic) — default
 1. Go to [console.anthropic.com](https://console.anthropic.com/)
 2. Create an account or sign in
 3. Navigate to **API Keys** → **Create Key**
 4. Copy the key — it starts with `sk-ant-`
 5. Save it as `ANTHROPIC_API_KEY` in your `.env`
+
+#### Option B: Grok (xAI)
+1. Go to [console.x.ai](https://console.x.ai/)
+2. Create an API key
+3. Save it as `XAI_API_KEY` in your `.env`
+4. Set `LLM_PROVIDER=grok` in your `.env`
+
+#### Option C: Gemini (Google)
+1. Go to [aistudio.google.com](https://aistudio.google.com/)
+2. Create an API key
+3. Save it as `GOOGLE_API_KEY` in your `.env`
+4. Set `LLM_PROVIDER=gemini` in your `.env`
 
 ### 3. Twilio (Phone System)
 
@@ -150,7 +163,10 @@ cp .env.example .env
 Edit `.env` with your values:
 
 ```env
+LLM_PROVIDER=claude
 ANTHROPIC_API_KEY=sk-ant-your-key-here
+# XAI_API_KEY=xai-your-key-here        # for Grok
+# GOOGLE_API_KEY=AIza-your-key-here     # for Gemini
 TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 TWILIO_AUTH_TOKEN=your-auth-token
 TWILIO_PHONE_NUMBER=+12025551234
@@ -255,7 +271,11 @@ Here's what happens during a single call, step by step:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | Yes | — | Your Claude API key |
+| `LLM_PROVIDER` | No | `claude` | LLM backend: `claude`, `grok`, or `gemini` |
+| `LLM_MODEL` | No | per-provider | Override the default model |
+| `ANTHROPIC_API_KEY` | If claude | — | Anthropic API key |
+| `XAI_API_KEY` | If grok | — | xAI API key |
+| `GOOGLE_API_KEY` | If gemini | — | Google AI API key |
 | `TWILIO_ACCOUNT_SID` | Yes | — | Twilio Account SID |
 | `TWILIO_AUTH_TOKEN` | Yes | — | Twilio Auth Token |
 | `TWILIO_PHONE_NUMBER` | Yes | — | Your Twilio phone number |
@@ -277,7 +297,12 @@ PDAgent/
 ├── .env.example                # Template for environment variables
 │
 ├── agent/                      # AI conversation engine
-│   ├── brain.py                # Claude API integration
+│   ├── llm.py                  # LLM provider abstraction layer
+│   │   ├── ClaudeProvider      # Anthropic native SDK
+│   │   ├── GrokProvider        # xAI via OpenAI-compatible API
+│   │   ├── GeminiProvider      # Google via OpenAI-compatible API
+│   │   └── get_provider()      # Factory (cached singleton)
+│   ├── brain.py                # Conversation logic (provider-agnostic)
 │   │   ├── respond()           # Generate reply to caller input
 │   │   ├── generate_greeting() # Create initial greeting
 │   │   └── summarize_call()    # Post-call summary generation
@@ -331,9 +356,13 @@ Full list: [Twilio TTS Voices](https://www.twilio.com/docs/voice/twiml/say/text-
 
 ### Change the AI Model
 
-Edit `agent/brain.py` — change the `model` parameter in the API calls. Options:
-- `claude-sonnet-4-5-20250929` — fast, cost-effective (default)
-- `claude-opus-4-6` — most capable, higher cost
+Set `LLM_MODEL` in your `.env` to override the default model for your provider:
+
+| Provider | Default Model | Alternatives |
+|----------|--------------|--------------|
+| `claude` | `claude-sonnet-4-5-20250929` | `claude-opus-4-6` |
+| `grok` | `grok-3-mini` | `grok-3` |
+| `gemini` | `gemini-2.5-flash` | `gemini-2.5-pro` |
 
 ### Add SMS Notifications (Alternative to Telegram)
 
@@ -393,7 +422,7 @@ docker run -d --env-file .env -p 8000:8000 pdagent
 
 ### Agent doesn't respond / Timeout
 - Check your server logs for errors
-- Verify `ANTHROPIC_API_KEY` is valid
+- Verify your LLM API key is valid (check `LLM_PROVIDER` matches the key you set)
 - Ensure ngrok is running and the URL matches Twilio webhooks
 - Test the `/health` endpoint: `curl https://your-url/health`
 
@@ -420,7 +449,7 @@ docker run -d --env-file .env -p 8000:8000 pdagent
 |---------|------|-------|
 | **Twilio Voice** | ~$0.014/min inbound | Per-minute billing |
 | **Twilio Phone Number** | ~$1.15/month | Monthly number rental |
-| **Claude Sonnet** | ~$0.003 per input/1K tokens | Very affordable per call |
+| **LLM (Claude/Grok/Gemini)** | ~$0.001–0.003 per 1K tokens | Varies by provider & model |
 | **Telegram** | Free | No API costs |
 | **Typical 3-min call** | ~$0.05–0.08 total | All services combined |
 
