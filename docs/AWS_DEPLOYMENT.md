@@ -6,7 +6,7 @@ This guide covers three deployment options on AWS, from simplest to most product
 2. **[ECS Fargate (Recommended)](#option-2-ecs-fargate--recommended)** — Serverless containers, no server management
 3. **[Elastic Beanstalk (Quick)](#option-3-elastic-beanstalk--quick-deploy)** — PaaS-style, fast deployment
 
-All options result in a publicly accessible HTTPS endpoint that Twilio can reach.
+All options result in a publicly accessible HTTPS endpoint where callers can reach Sophie via `/call` and you can monitor via `/dashboard`.
 
 ---
 
@@ -28,7 +28,7 @@ All options result in a publicly accessible HTTPS endpoint that Twilio can reach
    # Enter: Access Key ID, Secret Access Key, Region (e.g., us-east-1), Output format (json)
    ```
 3. **Docker installed** (for Options 2 & 3)
-4. **Your `.env` values ready** (API keys, tokens, etc.)
+4. **Your `.env` values ready** (LLM API key, SMTP credentials, dashboard API key, etc.)
 
 ---
 
@@ -71,6 +71,9 @@ python3.11 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
+# Create the data directory for call history
+mkdir -p data
+
 # Create your .env file
 cp .env.example .env
 nano .env   # Fill in all your values
@@ -95,6 +98,18 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # WebSocket support — required for /ws/call
+    location /ws/ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
     }
 }
 ```
@@ -158,11 +173,12 @@ sudo systemctl status pdagent
 journalctl -u pdagent -f
 ```
 
-### Step 6: Update Twilio Webhooks
+### Step 6: Verify and Update BASE_URL
 
-In the Twilio Console, update your phone number's webhooks to:
-- **Incoming call:** `https://your-domain.com/voice/incoming`
-- **Status callback:** `https://your-domain.com/voice/status`
+1. Update `BASE_URL` in your `.env` to match your domain (e.g., `https://your-domain.com`)
+2. Restart the service: `sudo systemctl restart pdagent`
+3. Open `https://your-domain.com/call` in Chrome to talk to Sophie
+4. Open `https://your-domain.com/dashboard` to view call history
 
 ---
 
@@ -201,20 +217,26 @@ Store your sensitive configuration in Parameter Store (free):
 aws ssm put-parameter --name "/pdagent/ANTHROPIC_API_KEY" \
   --type SecureString --value "sk-ant-your-key"
 
-aws ssm put-parameter --name "/pdagent/TWILIO_ACCOUNT_SID" \
-  --type SecureString --value "ACxxxxxxxx"
+aws ssm put-parameter --name "/pdagent/DASHBOARD_API_KEY" \
+  --type SecureString --value "your-strong-random-key"
 
-aws ssm put-parameter --name "/pdagent/TWILIO_AUTH_TOKEN" \
-  --type SecureString --value "your-token"
+aws ssm put-parameter --name "/pdagent/SMTP_HOST" \
+  --type String --value "smtp.gmail.com"
 
-aws ssm put-parameter --name "/pdagent/TWILIO_PHONE_NUMBER" \
-  --type String --value "+12025551234"
+aws ssm put-parameter --name "/pdagent/SMTP_PORT" \
+  --type String --value "587"
 
-aws ssm put-parameter --name "/pdagent/TELEGRAM_BOT_TOKEN" \
-  --type SecureString --value "123456:ABC..."
+aws ssm put-parameter --name "/pdagent/SMTP_USER" \
+  --type String --value "you@gmail.com"
 
-aws ssm put-parameter --name "/pdagent/TELEGRAM_CHAT_ID" \
-  --type String --value "123456789"
+aws ssm put-parameter --name "/pdagent/SMTP_PASSWORD" \
+  --type SecureString --value "your-app-password"
+
+aws ssm put-parameter --name "/pdagent/SMTP_FROM" \
+  --type String --value "you@gmail.com"
+
+aws ssm put-parameter --name "/pdagent/NOTIFICATION_EMAIL" \
+  --type String --value "you@gmail.com"
 
 aws ssm put-parameter --name "/pdagent/AGENT_NAME" \
   --type String --value "Sophie"
@@ -280,10 +302,18 @@ Create `task-definition.json`:
   "memory": "512",
   "executionRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/pdagent-task-role",
   "taskRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/pdagent-task-role",
+  "volumes": [{
+    "name": "pdagent-data",
+    "host": {}
+  }],
   "containerDefinitions": [{
     "name": "pdagent",
     "image": "YOUR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/pdagent:latest",
     "portMappings": [{"containerPort": 8000, "protocol": "tcp"}],
+    "mountPoints": [{
+      "sourceVolume": "pdagent-data",
+      "containerPath": "/app/data"
+    }],
     "healthCheck": {
       "command": ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""],
       "interval": 30,
@@ -302,19 +332,24 @@ Create `task-definition.json`:
     },
     "secrets": [
       {"name": "ANTHROPIC_API_KEY", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/ANTHROPIC_API_KEY"},
-      {"name": "TWILIO_ACCOUNT_SID", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/TWILIO_ACCOUNT_SID"},
-      {"name": "TWILIO_AUTH_TOKEN", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/TWILIO_AUTH_TOKEN"},
-      {"name": "TWILIO_PHONE_NUMBER", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/TWILIO_PHONE_NUMBER"},
-      {"name": "TELEGRAM_BOT_TOKEN", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/TELEGRAM_BOT_TOKEN"},
-      {"name": "TELEGRAM_CHAT_ID", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/TELEGRAM_CHAT_ID"},
+      {"name": "DASHBOARD_API_KEY", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/DASHBOARD_API_KEY"},
+      {"name": "SMTP_HOST", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/SMTP_HOST"},
+      {"name": "SMTP_PORT", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/SMTP_PORT"},
+      {"name": "SMTP_USER", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/SMTP_USER"},
+      {"name": "SMTP_PASSWORD", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/SMTP_PASSWORD"},
+      {"name": "SMTP_FROM", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/SMTP_FROM"},
+      {"name": "NOTIFICATION_EMAIL", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/NOTIFICATION_EMAIL"},
       {"name": "AGENT_NAME", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/AGENT_NAME"},
       {"name": "OWNER_NAME", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/OWNER_NAME"}
+    ],
+    "environment": [
+      {"name": "BASE_URL", "value": "https://your-domain.com"}
     ]
   }]
 }
 ```
 
-> Replace every `YOUR_ACCOUNT_ID` with your 12-digit AWS account ID.
+> Replace every `YOUR_ACCOUNT_ID` with your 12-digit AWS account ID and `your-domain.com` with your actual domain.
 
 ```bash
 aws ecs register-task-definition --cli-input-json file://task-definition.json
@@ -322,7 +357,7 @@ aws ecs register-task-definition --cli-input-json file://task-definition.json
 
 ### Step 7: Create an Application Load Balancer
 
-This gives you HTTPS with a fixed URL.
+This gives you HTTPS with a fixed URL. **Important:** The ALB must support WebSocket connections for `/ws/call`.
 
 ```bash
 # Get your default VPC and subnets
@@ -371,7 +406,7 @@ aws elbv2 create-listener \
   --default-actions Type=forward,TargetGroupArn=$TG_ARN
 ```
 
-> **For HTTPS:** Request a certificate in [ACM](https://console.aws.amazon.com/acm/), then add an HTTPS listener on port 443. This requires a custom domain — point your domain's DNS to the ALB's DNS name.
+> **For HTTPS:** Request a certificate in [ACM](https://console.aws.amazon.com/acm/), then add an HTTPS listener on port 443. This requires a custom domain — point your domain's DNS to the ALB's DNS name. AWS ALBs natively support WebSocket connections over HTTPS.
 
 ### Step 8: Create the ECS Service
 
@@ -386,7 +421,7 @@ aws ecs create-service \
   --load-balancers "targetGroupArn=$TG_ARN,containerName=pdagent,containerPort=8000"
 ```
 
-### Step 9: Get Your URL and Update Twilio
+### Step 9: Verify Deployment
 
 ```bash
 # Get the ALB DNS name
@@ -394,11 +429,11 @@ aws elbv2 describe-load-balancers --names pdagent-alb \
   --query "LoadBalancers[0].DNSName" --output text
 ```
 
-Update Twilio webhooks to:
-- `http://pdagent-alb-XXXX.us-east-1.elb.amazonaws.com/voice/incoming`
-- `http://pdagent-alb-XXXX.us-east-1.elb.amazonaws.com/voice/status`
+Then:
+- Open `http://pdagent-alb-XXXX.us-east-1.elb.amazonaws.com/call` to talk to Sophie
+- Open `http://pdagent-alb-XXXX.us-east-1.elb.amazonaws.com/dashboard` to view call history
 
-> For production, set up a custom domain with HTTPS via ACM + Route 53.
+> For production, set up a custom domain with HTTPS via ACM + Route 53, and update `BASE_URL` in your task definition.
 
 ### Updating the Deployment
 
@@ -414,6 +449,8 @@ docker push YOUR_ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/pdagent:latest
 aws ecs update-service --cluster pdagent-cluster --service pdagent-service --force-new-deployment
 ```
 
+> **Note on persistence:** Fargate tasks are ephemeral — call history in `data/call_history.jsonl` will be lost on redeployment. For durable storage, mount an EFS volume or use S3 for history persistence.
+
 ---
 
 ## Option 3: Elastic Beanstalk — Quick Deploy
@@ -428,7 +465,7 @@ pip install awsebcli
 
 ### Step 2: Create a Procfile
 
-Create `Procfile` in the project root:
+A `Procfile` is already included in the project root:
 
 ```
 web: uvicorn main:app --host 0.0.0.0 --port 8000
@@ -446,22 +483,50 @@ eb init pdagent --platform python-3.11 --region us-east-1
 eb create pdagent-prod \
   --instance-type t3.micro \
   --single \
-  --envvars ANTHROPIC_API_KEY=sk-ant-xxx,TWILIO_ACCOUNT_SID=ACxxx,TWILIO_AUTH_TOKEN=xxx,TWILIO_PHONE_NUMBER=+1xxx,TELEGRAM_BOT_TOKEN=xxx,TELEGRAM_CHAT_ID=xxx,AGENT_NAME=Sophie,OWNER_NAME=YourName
+  --envvars ANTHROPIC_API_KEY=sk-ant-xxx,DASHBOARD_API_KEY=your-key,SMTP_HOST=smtp.gmail.com,SMTP_PORT=587,SMTP_USER=you@gmail.com,SMTP_PASSWORD=xxx,SMTP_FROM=you@gmail.com,NOTIFICATION_EMAIL=you@gmail.com,AGENT_NAME=Sophie,OWNER_NAME=YourName,BASE_URL=https://your-eb-url.elasticbeanstalk.com
 
 # Wait for deployment (~5 minutes)
 eb status
 ```
 
-### Step 4: Enable HTTPS
+### Step 4: Enable HTTPS and WebSocket
 
 1. Go to [ACM Console](https://console.aws.amazon.com/acm/) → Request a certificate for your domain
 2. In EB Console → Configuration → Load Balancer → Add HTTPS listener on 443 with your cert
-3. Update Twilio webhooks to use the HTTPS URL
+3. Update `BASE_URL` environment variable to your HTTPS URL
+
+> **WebSocket support:** Elastic Beanstalk uses an ALB by default, which natively supports WebSocket connections. No additional configuration needed.
 
 ### Updating
 
 ```bash
 eb deploy
+```
+
+---
+
+## Data Persistence
+
+PDAgent stores call history in `data/call_history.jsonl`. Considerations by deployment option:
+
+| Option | Persistence | Recommendation |
+|--------|------------|----------------|
+| **EC2** | Durable (local disk) | Survives reboots. Back up periodically. |
+| **ECS Fargate** | Ephemeral (lost on redeploy) | Mount an EFS volume for durability. |
+| **Elastic Beanstalk** | Ephemeral (lost on redeploy) | Use EBS or EFS for the `data/` directory. |
+
+For ECS Fargate with EFS, add to your task definition:
+
+```json
+{
+  "volumes": [{
+    "name": "pdagent-data",
+    "efsVolumeConfiguration": {
+      "fileSystemId": "fs-XXXXXXXX",
+      "rootDirectory": "/pdagent"
+    }
+  }]
+}
 ```
 
 ---
@@ -514,6 +579,7 @@ aws cloudwatch put-metric-alarm \
 | ECS Fargate (256 CPU/512 MB) | ~$9.50 | No idle EC2 costs |
 | Elastic Beanstalk | ~$8.50 | Uses EC2 under the hood |
 | ALB | ~$16 + usage | Fixed cost for Fargate |
+| EFS (optional) | ~$0.30/GB | For persistent call history |
 | CloudWatch Logs | ~$0.50/GB | Minimal for this app |
 | ACM (SSL) | Free | Certificate manager |
 | **Total (Fargate)** | **~$26/mo** | Fully managed |
