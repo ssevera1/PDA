@@ -13,3 +13,4 @@ build/
 .pytest_cache/
 *.egg
 *.whl
+data/*.jsonl

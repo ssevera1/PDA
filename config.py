@@ -28,14 +28,28 @@ class Settings(BaseSettings):
     # Google (Gemini)
     google_api_key: str = ""
 
-    # Twilio
-    twilio_account_sid: str
-    twilio_auth_token: str
-    twilio_phone_number: str
+    # Twilio (optional — legacy, no longer required)
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    twilio_phone_number: str = ""
 
-    # Telegram
-    telegram_bot_token: str
-    telegram_chat_id: str
+    # Telegram (optional — legacy, no longer required)
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
+    # SMTP email notifications
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    notification_email: str = ""
+
+    # Dashboard
+    dashboard_api_key: str = ""
+
+    # Data persistence
+    data_dir: str = "data"
 
     # Agent personality
     agent_name: str = "Sophie"

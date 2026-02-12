@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PDAgent Dashboard</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         background:#f5f7fa; color:#333; }
+  .header { background:#1e293b; color:#fff; padding:16px 24px; display:flex;
+            align-items:center; justify-content:space-between; }
+  .header h1 { margin:0; font-size:1.3rem; }
+  .header .stats { font-size:.9rem; color:#94a3b8; }
+  .auth-overlay { position:fixed; inset:0; background:rgba(0,0,0,.5);
+                  display:flex; align-items:center; justify-content:center; z-index:100; }
+  .auth-box { background:#fff; padding:32px; border-radius:12px;
+              box-shadow:0 8px 32px rgba(0,0,0,.2); text-align:center; max-width:400px;
+              width:100%; }
+  .auth-box h2 { margin:0 0 8px; }
+  .auth-box p { color:#666; margin:0 0 20px; font-size:.9rem; }
+  .auth-box input { width:100%; padding:12px; border:1px solid #d1d5db;
+                    border-radius:8px; font-size:1rem; margin-bottom:12px; }
+  .auth-box button { width:100%; padding:12px; background:#3b82f6; color:#fff;
+                     border:none; border-radius:8px; font-size:1rem; cursor:pointer; }
+  .auth-box button:hover { background:#2563eb; }
+  .auth-box .error { color:#ef4444; font-size:.85rem; margin-top:8px; min-height:1.2em; }
+  .content { max-width:800px; margin:0 auto; padding:24px; }
+  .live-badge { display:inline-flex; align-items:center; gap:6px; background:#22c55e;
+                color:#fff; padding:4px 12px; border-radius:12px; font-size:.8rem; }
+  .live-dot { width:8px; height:8px; background:#fff; border-radius:50%;
+              animation:pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  .card { background:#fff; border-radius:12px; box-shadow:0 1px 8px rgba(0,0,0,.06);
+          padding:20px; margin-bottom:16px; border-left:4px solid #3b82f6; }
+  .card.new { border-left-color:#22c55e; animation:slideIn .3s ease; }
+  @keyframes slideIn { from{opacity:0;transform:translateY(-10px)} to{opacity:1;transform:none} }
+  .card-header { display:flex; justify-content:space-between; align-items:center;
+                 margin-bottom:8px; }
+  .card-header .caller { font-weight:600; font-size:1.05rem; }
+  .card-header .time { color:#888; font-size:.85rem; }
+  .card-meta { color:#666; font-size:.85rem; margin-bottom:10px; }
+  .card-summary { white-space:pre-wrap; font-size:.9rem; line-height:1.5;
+                  background:#f8fafc; padding:12px; border-radius:8px; }
+  .empty { text-align:center; color:#888; padding:60px 20px; }
+  .logout { background:none; border:1px solid #475569; color:#94a3b8; padding:6px 14px;
+            border-radius:6px; cursor:pointer; font-size:.8rem; }
+  .logout:hover { background:#334155; }
+</style>
+</head>
+<body>
+
+<div class="auth-overlay" id="authOverlay">
+  <div class="auth-box">
+    <h2>Dashboard Login</h2>
+    <p>Enter your API key to access the dashboard</p>
+    <input type="password" id="apiKeyInput" placeholder="API key" autocomplete="off" />
+    <button id="authBtn">Authenticate</button>
+    <div class="error" id="authError"></div>
+  </div>
+</div>
+
+<div class="header">
+  <div>
+    <h1>PDAgent Dashboard</h1>
+  </div>
+  <div style="display:flex;align-items:center;gap:16px;">
+    <span class="stats" id="activeCalls"></span>
+    <span class="live-badge" id="liveBadge" style="display:none">
+      <span class="live-dot"></span> Live
+    </span>
+    <button class="logout" id="logoutBtn" style="display:none">Logout</button>
+  </div>
+</div>
+
+<div class="content" id="content">
+  <div class="empty" id="emptyState">Authenticating&hellip;</div>
+</div>
+
+<script>
+(function() {
+  var apiKey = localStorage.getItem('pdagent_api_key') || '';
+  var overlay   = document.getElementById('authOverlay');
+  var keyInput  = document.getElementById('apiKeyInput');
+  var authBtn   = document.getElementById('authBtn');
+  var authError = document.getElementById('authError');
+  var content   = document.getElementById('content');
+  var emptyEl   = document.getElementById('emptyState');
+  var activeCalls = document.getElementById('activeCalls');
+  var liveBadge = document.getElementById('liveBadge');
+  var logoutBtn = document.getElementById('logoutBtn');
+  var evtSource = null;
+
+  function headers() { return {'X-API-Key': apiKey}; }
+
+  function escapeHtml(s) {
+    var d = document.createElement('div');
+    d.appendChild(document.createTextNode(s));
+    return d.innerHTML;
+  }
+
+  function formatTime(iso) {
+    try { return new Date(iso).toLocaleString(); } catch(e) { return iso; }
+  }
+
+  function makeCard(rec, isNew) {
+    var div = document.createElement('div');
+    div.className = 'card' + (isNew ? ' new' : '');
+    div.innerHTML =
+      '<div class="card-header">' +
+        '<span class="caller">' + escapeHtml(rec.caller || 'Unknown') + '</span>' +
+        '<span class="time">' + escapeHtml(formatTime(rec.timestamp)) + '</span>' +
+      '</div>' +
+      '<div class="card-meta">' +
+        escapeHtml((rec.caller_city || '?') + ', ' + (rec.caller_state || '?')) +
+        ' &middot; ' + escapeHtml(rec.duration_display || '?') +
+        ' &middot; ' + (rec.turn_count || 0) + ' turns' +
+      '</div>' +
+      '<div class="card-summary">' + escapeHtml(rec.summary || 'No summary') + '</div>';
+    return div;
+  }
+
+  function loadHistory() {
+    fetch('/api/dashboard/history', {headers: headers()})
+      .then(function(r) {
+        if (r.status === 401) { logout(); throw new Error('auth'); }
+        return r.json();
+      })
+      .then(function(records) {
+        content.innerHTML = '';
+        if (!records.length) {
+          content.innerHTML = '<div class="empty">No calls yet</div>';
+          return;
+        }
+        // Most recent first
+        records.reverse();
+        records.forEach(function(rec) {
+          content.appendChild(makeCard(rec, false));
+        });
+      })
+      .catch(function(e) {
+        if (e.message !== 'auth') {
+          content.innerHTML = '<div class="empty">Failed to load history</div>';
+        }
+      });
+  }
+
+  function connectSSE() {
+    if (evtSource) evtSource.close();
+    evtSource = new EventSource('/api/dashboard/events?api_key=' + encodeURIComponent(apiKey));
+    // SSE uses header auth; fall back to manual fetch-based approach
+    evtSource.close(); // EventSource can't send headers; use polling + fetch instead
+
+    // Use a fetch-based SSE reader for header auth
+    fetchSSE();
+  }
+
+  function fetchSSE() {
+    fetch('/api/dashboard/events', {headers: headers()})
+      .then(function(r) {
+        if (!r.ok) return;
+        liveBadge.style.display = 'inline-flex';
+        var reader = r.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = '';
+
+        function read() {
+          reader.read().then(function(result) {
+            if (result.done) { liveBadge.style.display = 'none'; setTimeout(fetchSSE, 5000); return; }
+            buffer += decoder.decode(result.value, {stream: true});
+            var lines = buffer.split('\n');
+            buffer = lines.pop();
+            lines.forEach(function(line) {
+              if (line.startsWith('data: ')) {
+                try {
+                  var ev = JSON.parse(line.slice(6));
+                  if (ev.type === 'new_call') {
+                    // Prepend new card
+                    var first = content.querySelector('.card');
+                    var card = makeCard(ev, true);
+                    if (first) { content.insertBefore(card, first); }
+                    else { content.innerHTML = ''; content.appendChild(card); }
+                  }
+                } catch(e) {}
+              }
+            });
+            read();
+          }).catch(function() { liveBadge.style.display = 'none'; setTimeout(fetchSSE, 5000); });
+        }
+        read();
+      })
+      .catch(function() { setTimeout(fetchSSE, 5000); });
+  }
+
+  function pollActiveCalls() {
+    fetch('/')
+      .then(function(r) { return r.json(); })
+      .then(function(d) { activeCalls.textContent = 'Active: ' + (d.active_calls || 0); })
+      .catch(function() {});
+  }
+
+  function authenticate(key) {
+    apiKey = key;
+    // Test the key by fetching history
+    fetch('/api/dashboard/history', {headers: {'X-API-Key': key}})
+      .then(function(r) {
+        if (r.status === 401) { authError.textContent = 'Invalid API key'; return; }
+        if (!r.ok) { authError.textContent = 'Server error'; return; }
+        localStorage.setItem('pdagent_api_key', key);
+        overlay.style.display = 'none';
+        logoutBtn.style.display = 'inline-block';
+        loadHistory();
+        fetchSSE();
+        pollActiveCalls();
+        setInterval(pollActiveCalls, 15000);
+      })
+      .catch(function() { authError.textContent = 'Connection failed'; });
+  }
+
+  function logout() {
+    localStorage.removeItem('pdagent_api_key');
+    apiKey = '';
+    overlay.style.display = 'flex';
+    logoutBtn.style.display = 'none';
+    liveBadge.style.display = 'none';
+    content.innerHTML = '<div class="empty">Authenticating&hellip;</div>';
+    if (evtSource) evtSource.close();
+  }
+
+  // Event handlers
+  authBtn.addEventListener('click', function() {
+    var key = keyInput.value.trim();
+    if (!key) { authError.textContent = 'Please enter an API key'; return; }
+    authError.textContent = '';
+    authenticate(key);
+  });
+  keyInput.addEventListener('keydown', function(ev) {
+    if (ev.key === 'Enter') authBtn.click();
+  });
+  logoutBtn.addEventListener('click', logout);
+
+  // Auto-login if key is stored
+  if (apiKey) {
+    authenticate(apiKey);
+  }
+})();
+</script>
+</body>
+</html>
