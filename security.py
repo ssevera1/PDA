@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import logging
 import time
 from collections import defaultdict
 
-from fastapi import Request, Response, HTTPException, Header
+from fastapi import Request, Response, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from config import get_settings
 from store.conversations import store
 
 logger = logging.getLogger("pdagent.security")
@@ -34,7 +32,7 @@ class RateLimiter:
         cutoff = now - self.window
         # Prune old entries
         hits = [t for t in self._hits.get(key, []) if t > cutoff]
-        # VULN-20: Clean up empty keys to prevent memory leak
+        # Clean up empty keys to prevent memory leak
         if not hits:
             self._hits.pop(key, None)
             hits = []
@@ -50,14 +48,13 @@ _limiter = RateLimiter(max_requests=30, window_seconds=60)
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Rate-limit requests to /ws/* and /api/* endpoints by caller IP."""
+    """Rate-limit requests to /voice/* endpoints by caller IP."""
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        if not (path.startswith("/ws") or path.startswith("/api")):
+        if not path.startswith("/voice"):
             return await call_next(request)
 
-        # VULN-21: Use direct client IP, not spoofable X-Forwarded-For
         client_ip = request.client.host if request.client else "unknown"
 
         if not _limiter.is_allowed(client_ip):
@@ -72,7 +69,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 # ---------------------------------------------------------------------------
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Add security headers to all responses (VULN-26, VULN-27)."""
+    """Add security headers to all responses."""
 
     async def dispatch(self, request: Request, call_next):
         response: Response = await call_next(request)
@@ -80,31 +77,9 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline'; "
-            "connect-src 'self' ws: wss:; "
-            "img-src 'self'; "
-            "frame-ancestors 'none'"
+            "default-src 'none'; frame-ancestors 'none'"
         )
         return response
-
-
-# ---------------------------------------------------------------------------
-# Dashboard API Key Authentication
-# ---------------------------------------------------------------------------
-
-async def require_api_key(x_api_key: str = Header(alias="X-API-Key")) -> str:
-    """FastAPI dependency that validates the dashboard API key."""
-    settings = get_settings()
-    if not settings.dashboard_api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="Dashboard API key not configured on server",
-        )
-    if not hmac.compare_digest(x_api_key, settings.dashboard_api_key):
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return x_api_key
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +94,6 @@ async def cleanup_stale_sessions():
     while True:
         await asyncio.sleep(300)
         now = time.time()
-        # VULN-29: snapshot keys to avoid dict-changed-during-iteration
         stale = [
             sid
             for sid, session in list(store._sessions.items())

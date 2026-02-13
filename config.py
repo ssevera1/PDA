@@ -28,25 +28,14 @@ class Settings(BaseSettings):
     # Google (Gemini)
     google_api_key: str = ""
 
-    # Twilio (optional — legacy, no longer required)
+    # Twilio
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
     twilio_phone_number: str = ""
 
-    # Telegram (optional — legacy, no longer required)
+    # Telegram notifications
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
-
-    # SMTP email notifications
-    smtp_host: str = ""
-    smtp_port: int = 587
-    smtp_user: str = ""
-    smtp_password: str = ""
-    smtp_from: str = ""
-    notification_email: str = ""
-
-    # Dashboard
-    dashboard_api_key: str = ""
 
     # Data persistence
     data_dir: str = "data"
@@ -65,13 +54,17 @@ class Settings(BaseSettings):
     }
 
     @model_validator(mode="after")
-    def _check_active_provider_key(self) -> "Settings":
+    def _check_required_keys(self) -> "Settings":
         if self.llm_provider == LLMProvider.claude and not self.anthropic_api_key:
             raise ValueError("ANTHROPIC_API_KEY is required when LLM_PROVIDER=claude")
         if self.llm_provider == LLMProvider.grok and not self.xai_api_key:
             raise ValueError("XAI_API_KEY is required when LLM_PROVIDER=grok")
         if self.llm_provider == LLMProvider.gemini and not self.google_api_key:
             raise ValueError("GOOGLE_API_KEY is required when LLM_PROVIDER=gemini")
+        if not self.twilio_auth_token:
+            raise ValueError(
+                "TWILIO_AUTH_TOKEN is required for Twilio signature validation"
+            )
         return self
 
 
