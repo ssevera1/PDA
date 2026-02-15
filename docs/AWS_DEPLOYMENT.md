@@ -6,7 +6,7 @@ This guide covers three deployment options on AWS, from simplest to most product
 2. **[ECS Fargate (Recommended)](#option-2-ecs-fargate--recommended)** — Serverless containers, no server management
 3. **[Elastic Beanstalk (Quick)](#option-3-elastic-beanstalk--quick-deploy)** — PaaS-style, fast deployment
 
-All options result in a publicly accessible HTTPS endpoint where callers can reach Sophie via `/call` and you can monitor via `/dashboard`.
+All options result in a publicly accessible HTTPS endpoint that Twilio can reach for voice webhooks. You receive call notifications via Telegram.
 
 ---
 
@@ -28,7 +28,9 @@ All options result in a publicly accessible HTTPS endpoint where callers can rea
    # Enter: Access Key ID, Secret Access Key, Region (e.g., us-east-1), Output format (json)
    ```
 3. **Docker installed** (for Options 2 & 3)
-4. **Your `.env` values ready** (LLM API key, SMTP credentials, dashboard API key, etc.)
+4. **Your `.env` values ready** (LLM API key, Twilio credentials, Telegram bot token)
+5. **Twilio account** with a phone number configured
+6. **Telegram bot** created via @BotFather
 
 ---
 
@@ -49,6 +51,7 @@ Best for: Learning, testing, low-traffic personal use.
      - Allow SSH (port 22) from your IP
      - Allow HTTPS (port 443) from anywhere
      - Allow HTTP (port 80) from anywhere
+     - Allow Custom TCP port 8000 from anywhere (for ngrok or direct access)
    - **Storage:** 8 GB (default is fine)
 4. Click **Launch Instance**
 
@@ -60,11 +63,11 @@ ssh -i your-key.pem ec2-user@<your-ec2-public-ip>
 
 # Install Python and dependencies
 sudo dnf update -y
-sudo dnf install -y python3.11 python3.11-pip git nginx
+sudo dnf install -y python3.11 python3.11-pip git
 
-# Clone your project (or upload it via scp)
-git clone <your-repo-url> ~/pdagent
-cd ~/pdagent
+# Clone your project
+git clone https://github.com/ssevera1/PDA.git ~/app
+cd ~/app
 
 # Set up Python environment
 python3.11 -m venv venv
@@ -76,67 +79,81 @@ mkdir -p data
 
 # Create your .env file
 cp .env.example .env
-nano .env   # Fill in all your values
+nano .env   # Fill in your values (see below)
 ```
 
-### Step 3: Set Up Nginx as Reverse Proxy
+Your `.env` should include:
+```env
+LLM_PROVIDER=grok                        # or claude, gemini
+XAI_API_KEY=xai-your-key                  # match your LLM_PROVIDER
+TWILIO_ACCOUNT_SID=ACxxxxx
+TWILIO_AUTH_TOKEN=your-auth-token
+TWILIO_PHONE_NUMBER=+15551234567
+TELEGRAM_BOT_TOKEN=123456789:ABCdef...
+TELEGRAM_CHAT_ID=123456789
+AGENT_NAME=Sophie
+OWNER_NAME=YourName
+BASE_URL=https://your-ngrok-url.ngrok-free.app   # set after ngrok starts
+```
+
+### Step 3: Set Up ngrok for HTTPS
+
+Twilio requires HTTPS for webhooks. The easiest way on EC2 is ngrok:
 
 ```bash
-sudo nano /etc/nginx/conf.d/pdagent.conf
+# Install ngrok
+sudo yum install -y snapd || true
+# Or download directly:
+wget https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
+tar xzf ngrok-v3-stable-linux-amd64.tgz
+sudo mv ngrok /usr/local/bin/
+
+# Sign up at https://dashboard.ngrok.com and get your auth token
+ngrok config add-authtoken YOUR_NGROK_AUTH_TOKEN
+
+# Start ngrok in the background
+nohup ngrok http 8000 --log=stdout > ngrok.log 2>&1 &
+
+# Get the public HTTPS URL
+sleep 2
+curl -s http://localhost:4040/api/tunnels | python3 -c "import sys,json; print(json.load(sys.stdin)['tunnels'][0]['public_url'])"
 ```
 
-Paste this configuration:
-
-```nginx
-server {
-    listen 80;
-    server_name your-domain.com;  # or use the EC2 public IP
-
-    location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    # WebSocket support — required for /ws/call
-    location /ws/ {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-    }
-}
+Copy the HTTPS URL (e.g., `https://abc123.ngrok-free.app`) and update your `.env`:
+```bash
+nano .env
+# Set BASE_URL=https://abc123.ngrok-free.app
 ```
+
+> **Note:** Free ngrok URLs change on restart. For a stable URL, use ngrok's paid plan ($8/mo for a fixed domain), or use a custom domain with nginx + Let's Encrypt (see [Alternative: nginx + SSL](#alternative-nginx--ssl-instead-of-ngrok) below).
+
+### Step 4: Start PDAgent
 
 ```bash
-sudo nginx -t          # Test config
-sudo systemctl start nginx
-sudo systemctl enable nginx
+source venv/bin/activate
+python main.py &
+
+# Verify it's running
+curl http://localhost:8000/health
+# {"status": "healthy"}
 ```
 
-### Step 4: Set Up SSL with Let's Encrypt
+### Step 5: Configure Twilio Webhooks
 
-```bash
-# Install certbot
-sudo dnf install -y certbot python3-certbot-nginx
+1. Go to [Twilio Console](https://console.twilio.com/) → **Phone Numbers** → **Active Numbers**
+2. Click your phone number
+3. Under **Voice Configuration**, set:
+   - **A call comes in**: Webhook → `https://abc123.ngrok-free.app/voice/incoming` (POST)
+   - **Call status changes**: `https://abc123.ngrok-free.app/voice/status` (POST)
+4. Click **Save configuration**
 
-# Get SSL certificate (replace with your domain)
-sudo certbot --nginx -d your-domain.com
+### Step 6: Test
 
-# Auto-renewal is set up automatically
-```
+Call your Twilio number — Sophie should answer. After the call ends, you'll receive a Telegram notification with the summary.
 
-> **No domain?** Use an [Elastic IP](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/elastic-ip-addresses-eip.html) and a free subdomain from [nip.io](https://nip.io) or [DuckDNS](https://www.duckdns.org/).
+### Step 7: Run as a Service (Optional)
 
-### Step 5: Run as a Service
-
-Create a systemd service so PDAgent starts automatically:
+Create a systemd service so PDAgent starts automatically on reboot:
 
 ```bash
 sudo nano /etc/systemd/system/pdagent.service
@@ -150,10 +167,10 @@ After=network.target
 [Service]
 Type=simple
 User=ec2-user
-WorkingDirectory=/home/ec2-user/pdagent
-Environment=PATH=/home/ec2-user/pdagent/venv/bin:/usr/bin
-EnvironmentFile=/home/ec2-user/pdagent/.env
-ExecStart=/home/ec2-user/pdagent/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+WorkingDirectory=/home/ec2-user/app
+Environment=PATH=/home/ec2-user/app/venv/bin:/usr/bin
+EnvironmentFile=/home/ec2-user/app/.env
+ExecStart=/home/ec2-user/app/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=5
 
@@ -173,12 +190,61 @@ sudo systemctl status pdagent
 journalctl -u pdagent -f
 ```
 
-### Step 6: Verify and Update BASE_URL
+### Updating the Deployment
 
-1. Update `BASE_URL` in your `.env` to match your domain (e.g., `https://your-domain.com`)
-2. Restart the service: `sudo systemctl restart pdagent`
-3. Open `https://your-domain.com/call` in Chrome to talk to Sophie
-4. Open `https://your-domain.com/dashboard` to view call history
+```bash
+cd ~/app
+git pull
+kill $(lsof -t -i:8000)
+sleep 1
+source venv/bin/activate
+python main.py &
+```
+
+Or if using systemd:
+```bash
+cd ~/app
+git pull
+sudo systemctl restart pdagent
+```
+
+### Alternative: nginx + SSL Instead of ngrok
+
+If you have a domain name, you can use nginx with Let's Encrypt instead of ngrok:
+
+```bash
+# Install nginx and certbot
+sudo dnf install -y nginx certbot python3-certbot-nginx
+
+# Configure nginx
+sudo nano /etc/nginx/conf.d/pdagent.conf
+```
+
+```nginx
+server {
+    listen 80;
+    server_name your-domain.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+```bash
+sudo nginx -t
+sudo systemctl start nginx
+sudo systemctl enable nginx
+
+# Get SSL certificate
+sudo certbot --nginx -d your-domain.com
+```
+
+> **No domain?** Get a free subdomain from [DuckDNS](https://www.duckdns.org/) — point it to your EC2 public IP, then run certbot with that subdomain.
 
 ---
 
@@ -214,30 +280,28 @@ docker push 123456789012.dkr.ecr.us-east-1.amazonaws.com/pdagent:latest
 Store your sensitive configuration in Parameter Store (free):
 
 ```bash
-aws ssm put-parameter --name "/pdagent/ANTHROPIC_API_KEY" \
-  --type SecureString --value "sk-ant-your-key"
+# LLM provider key (use the one matching your LLM_PROVIDER)
+aws ssm put-parameter --name "/pdagent/XAI_API_KEY" \
+  --type SecureString --value "xai-your-key"
 
-aws ssm put-parameter --name "/pdagent/DASHBOARD_API_KEY" \
-  --type SecureString --value "your-strong-random-key"
+# Twilio credentials
+aws ssm put-parameter --name "/pdagent/TWILIO_ACCOUNT_SID" \
+  --type SecureString --value "ACxxxxxxxx"
 
-aws ssm put-parameter --name "/pdagent/SMTP_HOST" \
-  --type String --value "smtp.gmail.com"
+aws ssm put-parameter --name "/pdagent/TWILIO_AUTH_TOKEN" \
+  --type SecureString --value "your-auth-token"
 
-aws ssm put-parameter --name "/pdagent/SMTP_PORT" \
-  --type String --value "587"
+aws ssm put-parameter --name "/pdagent/TWILIO_PHONE_NUMBER" \
+  --type String --value "+15551234567"
 
-aws ssm put-parameter --name "/pdagent/SMTP_USER" \
-  --type String --value "you@gmail.com"
+# Telegram notifications
+aws ssm put-parameter --name "/pdagent/TELEGRAM_BOT_TOKEN" \
+  --type SecureString --value "123456789:ABCdef..."
 
-aws ssm put-parameter --name "/pdagent/SMTP_PASSWORD" \
-  --type SecureString --value "your-app-password"
+aws ssm put-parameter --name "/pdagent/TELEGRAM_CHAT_ID" \
+  --type String --value "123456789"
 
-aws ssm put-parameter --name "/pdagent/SMTP_FROM" \
-  --type String --value "you@gmail.com"
-
-aws ssm put-parameter --name "/pdagent/NOTIFICATION_EMAIL" \
-  --type String --value "you@gmail.com"
-
+# Agent settings
 aws ssm put-parameter --name "/pdagent/AGENT_NAME" \
   --type String --value "Sophie"
 
@@ -331,18 +395,17 @@ Create `task-definition.json`:
       }
     },
     "secrets": [
-      {"name": "ANTHROPIC_API_KEY", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/ANTHROPIC_API_KEY"},
-      {"name": "DASHBOARD_API_KEY", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/DASHBOARD_API_KEY"},
-      {"name": "SMTP_HOST", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/SMTP_HOST"},
-      {"name": "SMTP_PORT", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/SMTP_PORT"},
-      {"name": "SMTP_USER", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/SMTP_USER"},
-      {"name": "SMTP_PASSWORD", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/SMTP_PASSWORD"},
-      {"name": "SMTP_FROM", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/SMTP_FROM"},
-      {"name": "NOTIFICATION_EMAIL", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/NOTIFICATION_EMAIL"},
+      {"name": "XAI_API_KEY", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/XAI_API_KEY"},
+      {"name": "TWILIO_ACCOUNT_SID", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/TWILIO_ACCOUNT_SID"},
+      {"name": "TWILIO_AUTH_TOKEN", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/TWILIO_AUTH_TOKEN"},
+      {"name": "TWILIO_PHONE_NUMBER", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/TWILIO_PHONE_NUMBER"},
+      {"name": "TELEGRAM_BOT_TOKEN", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/TELEGRAM_BOT_TOKEN"},
+      {"name": "TELEGRAM_CHAT_ID", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/TELEGRAM_CHAT_ID"},
       {"name": "AGENT_NAME", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/AGENT_NAME"},
       {"name": "OWNER_NAME", "valueFrom": "arn:aws:ssm:us-east-1:YOUR_ACCOUNT_ID:parameter/pdagent/OWNER_NAME"}
     ],
     "environment": [
+      {"name": "LLM_PROVIDER", "value": "grok"},
       {"name": "BASE_URL", "value": "https://your-domain.com"}
     ]
   }]
@@ -357,7 +420,7 @@ aws ecs register-task-definition --cli-input-json file://task-definition.json
 
 ### Step 7: Create an Application Load Balancer
 
-This gives you HTTPS with a fixed URL. **Important:** The ALB must support WebSocket connections for `/ws/call`.
+This gives you HTTPS with a fixed URL.
 
 ```bash
 # Get your default VPC and subnets
@@ -406,7 +469,7 @@ aws elbv2 create-listener \
   --default-actions Type=forward,TargetGroupArn=$TG_ARN
 ```
 
-> **For HTTPS:** Request a certificate in [ACM](https://console.aws.amazon.com/acm/), then add an HTTPS listener on port 443. This requires a custom domain — point your domain's DNS to the ALB's DNS name. AWS ALBs natively support WebSocket connections over HTTPS.
+> **For HTTPS:** Request a certificate in [ACM](https://console.aws.amazon.com/acm/), then add an HTTPS listener on port 443. This requires a custom domain — point your domain's DNS to the ALB's DNS name.
 
 ### Step 8: Create the ECS Service
 
@@ -421,7 +484,7 @@ aws ecs create-service \
   --load-balancers "targetGroupArn=$TG_ARN,containerName=pdagent,containerPort=8000"
 ```
 
-### Step 9: Verify Deployment
+### Step 9: Configure Twilio and Verify
 
 ```bash
 # Get the ALB DNS name
@@ -429,11 +492,11 @@ aws elbv2 describe-load-balancers --names pdagent-alb \
   --query "LoadBalancers[0].DNSName" --output text
 ```
 
-Then:
-- Open `http://pdagent-alb-XXXX.us-east-1.elb.amazonaws.com/call` to talk to Sophie
-- Open `http://pdagent-alb-XXXX.us-east-1.elb.amazonaws.com/dashboard` to view call history
+Then in the Twilio Console, set your phone number's webhooks to:
+- **A call comes in**: `https://your-alb-or-domain/voice/incoming` (POST)
+- **Call status changes**: `https://your-alb-or-domain/voice/status` (POST)
 
-> For production, set up a custom domain with HTTPS via ACM + Route 53, and update `BASE_URL` in your task definition.
+Call your Twilio number to verify Sophie answers.
 
 ### Updating the Deployment
 
@@ -483,19 +546,20 @@ eb init pdagent --platform python-3.11 --region us-east-1
 eb create pdagent-prod \
   --instance-type t3.micro \
   --single \
-  --envvars ANTHROPIC_API_KEY=sk-ant-xxx,DASHBOARD_API_KEY=your-key,SMTP_HOST=smtp.gmail.com,SMTP_PORT=587,SMTP_USER=you@gmail.com,SMTP_PASSWORD=xxx,SMTP_FROM=you@gmail.com,NOTIFICATION_EMAIL=you@gmail.com,AGENT_NAME=Sophie,OWNER_NAME=YourName,BASE_URL=https://your-eb-url.elasticbeanstalk.com
+  --envvars LLM_PROVIDER=grok,XAI_API_KEY=xai-xxx,TWILIO_ACCOUNT_SID=ACxxx,TWILIO_AUTH_TOKEN=xxx,TWILIO_PHONE_NUMBER=+15551234567,TELEGRAM_BOT_TOKEN=123:ABC,TELEGRAM_CHAT_ID=123,AGENT_NAME=Sophie,OWNER_NAME=YourName,BASE_URL=https://your-eb-url.elasticbeanstalk.com
 
 # Wait for deployment (~5 minutes)
 eb status
 ```
 
-### Step 4: Enable HTTPS and WebSocket
+### Step 4: Configure Twilio and Enable HTTPS
 
 1. Go to [ACM Console](https://console.aws.amazon.com/acm/) → Request a certificate for your domain
 2. In EB Console → Configuration → Load Balancer → Add HTTPS listener on 443 with your cert
 3. Update `BASE_URL` environment variable to your HTTPS URL
-
-> **WebSocket support:** Elastic Beanstalk uses an ALB by default, which natively supports WebSocket connections. No additional configuration needed.
+4. In Twilio Console, set webhooks to your EB URL:
+   - **A call comes in**: `https://your-eb-url/voice/incoming` (POST)
+   - **Call status changes**: `https://your-eb-url/voice/status` (POST)
 
 ### Updating
 
@@ -582,7 +646,7 @@ aws cloudwatch put-metric-alarm \
 | EFS (optional) | ~$0.30/GB | For persistent call history |
 | CloudWatch Logs | ~$0.50/GB | Minimal for this app |
 | ACM (SSL) | Free | Certificate manager |
+| ngrok (fixed domain) | ~$8 | Optional — free tier has changing URLs |
+| **Total (EC2 + ngrok)** | **~$17/mo** | Simplest setup |
 | **Total (Fargate)** | **~$26/mo** | Fully managed |
-| **Total (EC2)** | **~$9/mo** | Self-managed |
-
-> All prices are for `us-east-1`. Your costs may vary by region and usage.
+| **Total (EC2)** | **~$9/mo** | Self-managed, free ngrok |
