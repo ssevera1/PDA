@@ -29,7 +29,7 @@ def _twiml_response(twiml: str) -> Response:
 
 
 def _say(text: str) -> str:
-    """Wrap text in a <Say> verb with Google Studio voice."""
+    """Wrap text in a <Say> verb with Polly Neural voice."""
     # Escape XML special characters
     safe = (
         text.replace("&", "&amp;")
@@ -37,7 +37,7 @@ def _say(text: str) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
-    return f'<Say voice="Google.en-US-Studio-O">{safe}</Say>'
+    return f'<Say voice="Polly.Joanna-Neural">{safe}</Say>'
 
 
 def _gather_with_say(text: str, action_path: str, base_url: str) -> str:
