@@ -96,70 +96,46 @@ OWNER_NAME=YourName
 BASE_URL=https://your-ngrok-url.ngrok-free.app   # set after ngrok starts
 ```
 
-### Step 3: Set Up ngrok for HTTPS
+### Step 3: Install ngrok
 
 Twilio requires HTTPS for webhooks. The easiest way on EC2 is ngrok:
 
 ```bash
+# Sign up at https://dashboard.ngrok.com (free) and get your auth token
+
 # Install ngrok
-sudo yum install -y snapd || true
-# Or download directly:
 wget https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz
 tar xzf ngrok-v3-stable-linux-amd64.tgz
 sudo mv ngrok /usr/local/bin/
 
-# Sign up at https://dashboard.ngrok.com and get your auth token
+# Configure auth token
 ngrok config add-authtoken YOUR_NGROK_AUTH_TOKEN
-
-# Start ngrok in the background
-nohup ngrok http 8000 --log=stdout > ngrok.log 2>&1 &
-
-# Get the public HTTPS URL
-sleep 2
-curl -s http://localhost:4040/api/tunnels | python3 -c "import sys,json; print(json.load(sys.stdin)['tunnels'][0]['public_url'])"
 ```
 
-Copy the HTTPS URL (e.g., `https://abc123.ngrok-free.app`) and update your `.env`:
-```bash
-nano .env
-# Set BASE_URL=https://abc123.ngrok-free.app
-```
+### Step 4: Set Up Services
 
-> **Note:** Free ngrok URLs change on restart. For a stable URL, use ngrok's paid plan ($8/mo for a fixed domain), or use a custom domain with nginx + Let's Encrypt (see [Alternative: nginx + SSL](#alternative-nginx--ssl-instead-of-ngrok) below).
-
-### Step 4: Start PDAgent
+Run this entire block to create systemd services for both ngrok and PDAgent. They'll auto-start on boot and restart on crashes:
 
 ```bash
-source venv/bin/activate
-python main.py &
+# Create ngrok service
+sudo tee /etc/systemd/system/ngrok.service > /dev/null <<'EOF'
+[Unit]
+Description=ngrok tunnel
+After=network.target
 
-# Verify it's running
-curl http://localhost:8000/health
-# {"status": "healthy"}
-```
+[Service]
+Type=simple
+User=ec2-user
+ExecStart=/usr/local/bin/ngrok http 8000 --log=stdout
+Restart=always
+RestartSec=5
 
-### Step 5: Configure Twilio Webhooks
+[Install]
+WantedBy=multi-user.target
+EOF
 
-1. Go to [Twilio Console](https://console.twilio.com/) → **Phone Numbers** → **Active Numbers**
-2. Click your phone number
-3. Under **Voice Configuration**, set:
-   - **A call comes in**: Webhook → `https://abc123.ngrok-free.app/voice/incoming` (POST)
-   - **Call status changes**: `https://abc123.ngrok-free.app/voice/status` (POST)
-4. Click **Save configuration**
-
-### Step 6: Test
-
-Call your Twilio number — Sophie should answer. After the call ends, you'll receive a Telegram notification with the summary.
-
-### Step 7: Run as a Service (Optional)
-
-Create a systemd service so PDAgent starts automatically on reboot:
-
-```bash
-sudo nano /etc/systemd/system/pdagent.service
-```
-
-```ini
+# Create pdagent service
+sudo tee /etc/systemd/system/pdagent.service > /dev/null <<'EOF'
 [Unit]
 Description=PDAgent - Personal Digital Agent
 After=network.target
@@ -170,38 +146,89 @@ User=ec2-user
 WorkingDirectory=/home/ec2-user/app
 Environment=PATH=/home/ec2-user/app/venv/bin:/usr/bin
 EnvironmentFile=/home/ec2-user/app/.env
-ExecStart=/home/ec2-user/app/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+ExecStart=/home/ec2-user/app/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+# Enable and start both services
+sudo systemctl daemon-reload
+sudo systemctl enable ngrok pdagent
+sudo systemctl start ngrok
+sleep 3
+sudo systemctl start pdagent
 ```
 
+### Step 5: Get Your ngrok URL and Configure
+
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl start pdagent
-sudo systemctl enable pdagent
+# Get the public HTTPS URL
+curl -s http://localhost:4040/api/tunnels | python3 -c "import sys,json; print(json.load(sys.stdin)['tunnels'][0]['public_url'])"
+```
+
+Copy the HTTPS URL (e.g., `https://abc123.ngrok-free.app`) and update your `.env`:
+
+```bash
+nano ~/app/.env
+# Set BASE_URL=https://abc123.ngrok-free.app
+```
+
+Then restart PDAgent to pick up the new URL:
+
+```bash
+sudo systemctl restart pdagent
+```
+
+> **Note:** Free ngrok URLs change every time ngrok restarts. When that happens, you'll need to update `BASE_URL` in `.env`, restart pdagent, and update the Twilio webhook URLs. For a stable URL, use ngrok's paid plan ($8/mo for a fixed domain), or use a custom domain with nginx + Let's Encrypt (see [Alternative: nginx + SSL](#alternative-nginx--ssl-instead-of-ngrok) below).
+
+### Step 6: Configure Twilio Webhooks
+
+1. Go to [Twilio Console](https://console.twilio.com/) → **Phone Numbers** → **Active Numbers**
+2. Click your phone number
+3. Under **Voice Configuration**, set:
+   - **A call comes in**: Webhook → `https://abc123.ngrok-free.app/voice/incoming` (POST)
+   - **Call status changes**: `https://abc123.ngrok-free.app/voice/status` (POST)
+4. Click **Save configuration**
+
+### Step 7: Test
+
+```bash
+# Verify both services are running
+sudo systemctl status ngrok --no-pager
+sudo systemctl status pdagent --no-pager
+
+# Test health endpoint
+curl http://localhost:8000/health
+# {"status": "healthy"}
+```
+
+Call your Twilio number — Sophie should answer. After the call ends, you'll receive a Telegram notification with the summary.
+
+### Managing the Services
+
+```bash
+# View PDAgent logs (live)
+journalctl -u pdagent -f
+
+# View ngrok logs
+journalctl -u ngrok -f
+
+# Restart after config changes
+sudo systemctl restart pdagent
+
+# Stop everything
+sudo systemctl stop pdagent ngrok
 
 # Check status
 sudo systemctl status pdagent
-
-# View logs
-journalctl -u pdagent -f
+sudo systemctl status ngrok
 ```
 
 ### Updating the Deployment
 
-```bash
-cd ~/app
-git pull
-kill $(lsof -t -i:8000)
-sleep 1
-source venv/bin/activate
-python main.py &
-```
-
-Or if using systemd:
 ```bash
 cd ~/app
 git pull
