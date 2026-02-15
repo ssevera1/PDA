@@ -1,10 +1,8 @@
 # PDAgent — Personal Digital Agent
 
-An AI-powered personal assistant that handles conversations through your browser using Claude, Grok, or Gemini, and notifies you via email and a real-time dashboard.
+An AI-powered personal assistant that handles your phone calls via Twilio using Claude, Grok, or Gemini, and notifies you via Telegram.
 
-**Visit `/call` → Sophie (the AI) picks up → She helps the caller → You get a report via email + dashboard.**
-
-No external telephony or messaging services required — everything runs self-hosted except the LLM API.
+**Your phone rings → Twilio forwards the call → Sophie (the AI) picks up → She helps the caller → You get a Telegram notification with a full summary.**
 
 ---
 
@@ -16,8 +14,8 @@ No external telephony or messaging services required — everything runs self-ho
 - [Setup Guide](#setup-guide)
   - [1. Clone & Install](#1-clone--install)
   - [2. LLM Provider](#2-llm-provider-choose-one)
-  - [3. SMTP Email (Optional)](#3-smtp-email-optional)
-  - [4. Dashboard API Key](#4-dashboard-api-key)
+  - [3. Twilio](#3-twilio)
+  - [4. Telegram Notifications](#4-telegram-notifications)
   - [5. Configure Environment](#5-configure-environment)
 - [Running the Agent](#running-the-agent)
 - [Call Flow](#call-flow)
@@ -33,13 +31,14 @@ No external telephony or messaging services required — everything runs self-ho
 
 ## How It Works
 
-1. A caller visits `https://your-server/call` in their browser
-2. They click "Call Sophie" — a WebSocket connection opens
-3. The browser's Speech Recognition API captures their voice (or they type)
-4. Sophie responds via the browser's Speech Synthesis API (or text)
-5. The conversation continues until the issue is resolved or the call ends
-6. When the call ends, the LLM summarizes the entire conversation
-7. You receive a notification via email and the real-time dashboard at `/dashboard`
+1. Someone calls your real phone number
+2. Your carrier forwards the call to your Twilio number
+3. Twilio hits your server's `/voice/incoming` webhook
+4. Sophie greets the caller and begins a conversation via TwiML `<Say>` + `<Gather>`
+5. Each time the caller speaks, Twilio transcribes it and sends it to `/voice/gather`
+6. The LLM generates a response, which Twilio speaks back to the caller
+7. When the call ends (naturally or via hangup), the LLM summarizes the conversation
+8. You receive a Telegram notification with the full call report
 
 ---
 
@@ -47,12 +46,18 @@ No external telephony or messaging services required — everything runs self-ho
 
 ```
 ┌──────────────┐     ┌──────────────────────────────┐
-│  Caller's    │────▶│   PDAgent (FastAPI)           │
-│  Browser     │◀────│                               │
-│              │ WS  │  ┌─────────────┐              │
-│ SpeechRecog. │────▶│  │ WebSocket   │              │
-│ SpeechSynth. │◀────│  │ Handler     │              │
-└──────────────┘     │  └──────┬──────┘              │
+│  Caller's    │────▶│   Twilio                      │
+│  Phone       │◀────│   (Voice Platform)             │
+└──────────────┘     └──────────┬───────────────────┘
+                                │ TwiML Webhooks
+                     ┌──────────▼───────────────────┐
+                     │   PDAgent (FastAPI)           │
+                     │                               │
+                     │  ┌─────────────┐              │
+                     │  │ Twilio      │              │
+                     │  │ Webhook     │              │
+                     │  │ Handler     │              │
+                     │  └──────┬──────┘              │
                      │         │                     │
                      │  ┌──────▼──────┐              │
                      │  │  LLM Brain  │              │
@@ -62,30 +67,27 @@ No external telephony or messaging services required — everything runs self-ho
                      │         │                     │
                      │  ┌──────▼──────┐              │
                      │  │ Dispatcher  │              │
-                     │  └──┬────┬──┬──┘              │
-                     │     │    │  │                  │
-                     └─────│────│──│──────────────────┘
-                           │    │  │
-              ┌────────────┘    │  └────────────┐
-              ▼                 ▼               ▼
-        ┌──────────┐    ┌────────────┐   ┌───────────┐
-        │  SMTP    │    │  JSONL     │   │  SSE      │
-        │  Email   │    │  History   │   │ Dashboard │
-        │  (You)   │    │  (Disk)    │   │  (You)    │
-        └──────────┘    └────────────┘   └───────────┘
+                     │  └──┬───────┬──┘              │
+                     │     │       │                  │
+                     └─────│───────│──────────────────┘
+                           │       │
+              ┌────────────┘       └────────────┐
+              ▼                                 ▼
+        ┌──────────┐                     ┌───────────┐
+        │  JSONL   │                     │ Telegram  │
+        │  History │                     │ Bot API   │
+        │  (Disk)  │                     │  (You)    │
+        └──────────┘                     └───────────┘
 ```
 
 **Tech Stack:**
 | Component | Technology | Purpose |
 |-----------|-----------|---------|
-| Web Framework | FastAPI (Python) | WebSocket server + API |
+| Web Framework | FastAPI (Python) | TwiML webhook server |
 | AI Engine | Claude / Grok / Gemini (configurable) | Conversation & summarization |
-| Voice Input | Browser Web Speech API | Speech-to-text |
-| Voice Output | Browser SpeechSynthesis API | Text-to-speech |
-| Notifications | SMTP email (stdlib) + SSE dashboard | Call reports to you |
+| Voice Platform | Twilio | Phone call handling, speech recognition & synthesis |
+| Notifications | Telegram Bot API | Call reports to you |
 | Persistence | JSONL file | Call history |
-| Fallback STT | Whisper (optional) | Server-side transcription |
-| Fallback TTS | pyttsx3 (optional) | Server-side synthesis |
 
 ---
 
@@ -93,8 +95,9 @@ No external telephony or messaging services required — everything runs self-ho
 
 - **Python 3.11+**
 - **LLM API key** — one of: Anthropic (Claude), xAI (Grok), or Google (Gemini)
-- **SMTP credentials** (optional — for email notifications; Gmail, Outlook, etc.)
-- A modern browser with microphone access (Chrome recommended for speech APIs)
+- **Twilio account** — with a phone number and voice webhooks configured
+- **Telegram bot** — for receiving call notifications
+- **Public URL** — your server must be reachable by Twilio (use ngrok for local dev)
 
 ---
 
@@ -136,25 +139,34 @@ pip install -r requirements.txt
 3. Save it as `GOOGLE_API_KEY` in your `.env`
 4. Set `LLM_PROVIDER=gemini` in your `.env`
 
-### 3. SMTP Email (Optional)
+### 3. Twilio
 
-If you want email notifications when calls complete:
+1. Sign up at [twilio.com](https://www.twilio.com/) and get a phone number
+2. In the Twilio Console, go to your phone number's configuration
+3. Under **Voice & Fax**, set:
+   - **A call comes in**: Webhook → `https://your-domain/voice/incoming` (HTTP POST)
+   - **Status callback URL**: `https://your-domain/voice/status` (HTTP POST)
+4. Copy your **Account SID** and **Auth Token** from the Twilio dashboard
+5. Save them in your `.env`:
+   ```
+   TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   TWILIO_AUTH_TOKEN=your-auth-token
+   TWILIO_PHONE_NUMBER=+15551234567
+   ```
+6. Set up call forwarding on your real phone number to forward to your Twilio number
 
-1. Use your email provider's SMTP settings (e.g., Gmail, Outlook, Fastmail)
-2. For Gmail, create an [App Password](https://myaccount.google.com/apppasswords)
-3. Configure `SMTP_*` and `NOTIFICATION_EMAIL` in your `.env`
+### 4. Telegram Notifications
 
-If SMTP is not configured, notifications are still available via the dashboard and persisted to `data/call_history.jsonl`.
-
-### 4. Dashboard API Key
-
-Generate a strong random key for dashboard access:
-
-```bash
-python -c "import secrets; print(secrets.token_urlsafe(32))"
-```
-
-Save it as `DASHBOARD_API_KEY` in your `.env`.
+1. Open Telegram and message [@BotFather](https://t.me/BotFather)
+2. Send `/newbot` and follow the prompts to create a bot
+3. Copy the bot token (looks like `123456789:ABCdefGHI...`)
+4. Send any message to your new bot
+5. Get your chat ID by visiting `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
+6. Save both in your `.env`:
+   ```
+   TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
+   TELEGRAM_CHAT_ID=123456789
+   ```
 
 ### 5. Configure Environment
 
@@ -168,16 +180,14 @@ Edit `.env` with your values:
 LLM_PROVIDER=claude
 ANTHROPIC_API_KEY=sk-ant-your-key-here
 
-# Email notifications (optional)
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USER=you@gmail.com
-SMTP_PASSWORD=your-app-password
-SMTP_FROM=you@gmail.com
-NOTIFICATION_EMAIL=you@gmail.com
+# Twilio (required)
+TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_AUTH_TOKEN=your-auth-token
+TWILIO_PHONE_NUMBER=+15551234567
 
-# Dashboard access
-DASHBOARD_API_KEY=your-strong-random-key
+# Telegram notifications
+TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
+TELEGRAM_CHAT_ID=123456789
 
 # Agent personality
 AGENT_NAME=Sophie
@@ -202,9 +212,11 @@ curl http://localhost:8000/health
 # {"status": "healthy"}
 ```
 
-**Use it:**
-- **Call Sophie:** Open `http://localhost:8000/call` in Chrome
-- **View Dashboard:** Open `http://localhost:8000/dashboard` and enter your API key
+**For local development with Twilio,** expose your server with ngrok:
+```bash
+ngrok http 8000
+```
+Then update the Twilio webhook URLs and `BASE_URL` in `.env` with the ngrok URL.
 
 ---
 
@@ -213,36 +225,37 @@ curl http://localhost:8000/health
 Here's what happens during a single call, step by step:
 
 ```
-1. CONNECT ─────────────────────────────────────────────────
-   Caller opens /call in browser → clicks "Call Sophie"
-   Browser opens WebSocket → /ws/call
+1. INCOMING CALL ──────────────────────────────────────────
+   Caller dials your phone number
+   Carrier forwards to Twilio number
+   Twilio POSTs to /voice/incoming
 
-2. GREETING ────────────────────────────────────────────────
+2. GREETING ───────────────────────────────────────────────
    LLM generates a warm greeting
-   Browser speaks it via SpeechSynthesis
-   Browser begins listening via SpeechRecognition
+   Server returns TwiML: <Say>greeting</Say><Gather>
+   Twilio speaks the greeting, begins listening
 
-3. CONVERSATION LOOP ──────────────────────────────────────
-   ┌─→ Caller speaks (or types)
-   │   Browser transcribes speech → sends via WebSocket
+3. CONVERSATION LOOP ─────────────────────────────────────
+   ┌─→ Caller speaks
+   │   Twilio transcribes → POSTs SpeechResult to /voice/gather
    │   LLM generates contextual response
-   │   Response sent back → browser speaks it
-   │   Browser begins listening again
+   │   Server returns TwiML: <Say>reply</Say><Gather>
+   │   Twilio speaks reply, begins listening again
    └─────────────────────────────────────────────── loop
 
-4. CALL ENDS ───────────────────────────────────────────────
-   Caller clicks end, or LLM signals CALL_COMPLETE,
-   or turn limit reached (20 turns max)
+4. CALL ENDS ──────────────────────────────────────────────
+   LLM signals CALL_COMPLETE → <Say>goodbye</Say><Hangup/>
+   Or turn limit reached (20 turns max)
+   Or caller hangs up → Twilio POSTs to /voice/status
 
-5. SUMMARY & NOTIFICATION ─────────────────────────────────
+5. SUMMARY & NOTIFICATION ────────────────────────────────
    LLM analyzes full transcript
    Generates structured summary:
      - Caller name & number
      - Topic & details
      - Action items & urgency
    Record saved to data/call_history.jsonl
-   Email sent (if SMTP configured)
-   Dashboard updated in real-time via SSE
+   Telegram notification sent with full report
 ```
 
 ---
@@ -256,17 +269,15 @@ Here's what happens during a single call, step by step:
 | `ANTHROPIC_API_KEY` | If claude | — | Anthropic API key |
 | `XAI_API_KEY` | If grok | — | xAI API key |
 | `GOOGLE_API_KEY` | If gemini | — | Google AI API key |
-| `SMTP_HOST` | No | — | SMTP server hostname |
-| `SMTP_PORT` | No | `587` | SMTP port (587 for STARTTLS, 465 for SSL) |
-| `SMTP_USER` | No | — | SMTP username |
-| `SMTP_PASSWORD` | No | — | SMTP password / app password |
-| `SMTP_FROM` | No | — | Sender email address |
-| `NOTIFICATION_EMAIL` | No | — | Where to send call reports |
-| `DASHBOARD_API_KEY` | Yes | — | API key for dashboard access |
+| `TWILIO_ACCOUNT_SID` | No | — | Twilio Account SID |
+| `TWILIO_AUTH_TOKEN` | Yes | — | Twilio Auth Token (used for signature validation) |
+| `TWILIO_PHONE_NUMBER` | No | — | Your Twilio phone number |
+| `TELEGRAM_BOT_TOKEN` | No | — | Telegram bot token from @BotFather |
+| `TELEGRAM_CHAT_ID` | No | — | Your Telegram chat ID |
 | `DATA_DIR` | No | `data` | Directory for call history persistence |
 | `AGENT_NAME` | No | `Sophie` | What the agent calls herself |
 | `OWNER_NAME` | No | `Boss` | How the agent refers to you |
-| `BASE_URL` | No | `http://localhost:8000` | Public URL (used for origin validation) |
+| `BASE_URL` | No | `http://localhost:8000` | Public URL (used in TwiML action URLs) |
 
 ---
 
@@ -276,7 +287,7 @@ Here's what happens during a single call, step by step:
 PDAgent/
 ├── main.py                        # FastAPI app, routing, middleware
 ├── config.py                      # Environment config via pydantic-settings
-├── security.py                    # Rate limiting, API key auth, security headers
+├── security.py                    # Rate limiting, security headers
 ├── requirements.txt               # Python dependencies
 ├── .env.example                   # Template for environment variables
 │
@@ -292,27 +303,23 @@ PDAgent/
 │   │   └── summarize_call()       #   Post-call summary generation
 │   └── prompts.py                 # System prompts & personality
 │
-├── voice/                         # Browser-based voice system
-│   ├── websocket.py               # WebSocket call handler (/ws/call)
-│   ├── stt.py                     # Optional Whisper STT fallback
-│   └── tts.py                     # Optional pyttsx3 TTS fallback
+├── voice/                         # Twilio voice handling
+│   └── twilio_webhook.py          # TwiML webhook endpoints
+│       ├── POST /voice/incoming   #   Handle new incoming call
+│       ├── POST /voice/gather     #   Process caller speech, return reply
+│       └── POST /voice/status     #   Handle call completion/hangup
 │
 ├── notifications/                 # Notification system
-│   ├── email.py                   # SMTP email notifications
-│   ├── dashboard.py               # SSE stream + JSONL call history
-│   └── dispatcher.py              # Multi-channel notification router
+│   ├── telegram.py                # Telegram Bot API notifications
+│   └── dispatcher.py              # JSONL persistence + notification routing
 │
 ├── store/                         # State management
 │   └── conversations.py           # In-memory call session store
 │
-├── static/                        # Web clients
-│   ├── call.html                  # Caller-facing voice client
-│   └── dashboard.html             # Owner's notification dashboard
-│
 ├── data/                          # Persisted call records
 │   └── call_history.jsonl         # One JSON record per completed call
 │
-├── test_websocket_flow.py         # Integration test suite (11 tests)
+├── test_twilio_flow.py            # Integration test suite (11 tests)
 ├── Dockerfile                     # Docker container config
 └── Procfile                       # Cloud platform deployment
 ```
@@ -340,19 +347,9 @@ Set `LLM_MODEL` in your `.env` to override the default model for your provider:
 | `grok` | `grok-3-mini` | `grok-3` |
 | `gemini` | `gemini-2.5-flash` | `gemini-2.5-pro` |
 
-### Optional: Server-Side STT/TTS Fallbacks
+### Change the Voice
 
-If callers use browsers without Web Speech API support:
-
-```bash
-# Server-side speech-to-text (Whisper)
-pip install openai-whisper
-
-# Server-side text-to-speech (pyttsx3)
-pip install pyttsx3
-```
-
-These are automatically available at `/api/stt/transcribe` and `/api/tts/speak` when installed.
+The TwiML voice is set in `voice/twilio_webhook.py` — currently `Polly.Joanna` (Amazon Polly via Twilio). You can change it to any [Twilio-supported voice](https://www.twilio.com/docs/voice/twiml/say#voice).
 
 ---
 
@@ -360,17 +357,13 @@ These are automatically available at `/api/stt/transcribe` and `/api/tts/speak` 
 
 PDAgent includes multiple layers of security hardening:
 
-- **WebSocket origin validation** — only allows connections from your configured `BASE_URL`
-- **Concurrent connection cap** — limits simultaneous calls to prevent resource exhaustion
-- **Per-message rate limiting** — throttles speech messages to prevent LLM API abuse
-- **Message length limits** — caps input at 2000 characters
+- **Twilio signature validation** — every webhook request is verified using `X-Twilio-Signature` and your auth token
+- **Concurrent call cap** — limits simultaneous calls to prevent resource exhaustion
 - **Input sanitization** — caller-supplied fields are truncated and stripped of newlines
-- **Dashboard API key auth** — timing-safe comparison via `hmac.compare_digest`
-- **Security headers** — CSP, X-Frame-Options (DENY), X-Content-Type-Options, Referrer-Policy
-- **Rate limiting** — 30 requests per minute per IP on `/ws/*` and `/api/*` endpoints
-- **SMTP TLS enforcement** — always uses TLS with certificate verification
+- **Security headers** — CSP (`default-src 'none'`), X-Frame-Options (DENY), X-Content-Type-Options, Referrer-Policy
+- **Rate limiting** — 30 requests per minute per IP on `/voice/*` endpoints
 - **Session cleanup** — background task purges stale sessions after 1 hour
-- **JSONL pagination** — history API limits response size to prevent memory exhaustion
+- **Turn limit** — conversations capped at 20 turns to prevent runaway LLM costs
 
 ---
 
@@ -383,7 +376,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-For production, use a reverse proxy (nginx/Caddy) with HTTPS in front of uvicorn.
+For production, use a reverse proxy (nginx/Caddy) with HTTPS in front of uvicorn. Twilio requires HTTPS for webhooks.
 
 ### Option B: Docker
 
@@ -400,39 +393,48 @@ The `data/` directory is a Docker volume for persisting call history across rest
 2. Connect the repo to your platform of choice
 3. Set all environment variables in the platform's dashboard
 4. Update `BASE_URL` to your deployed URL
+5. Point Twilio webhooks to your deployed URL
 
 ### Option D: AWS
 
 See the **[AWS Deployment Guide](docs/AWS_DEPLOYMENT.md)** covering EC2, ECS Fargate, and Elastic Beanstalk.
 
+### ngrok for Local Development
+
+```bash
+ngrok http 8000
+```
+
+Copy the HTTPS URL (e.g., `https://abc123.ngrok-free.app`) and:
+1. Set `BASE_URL` in `.env` to the ngrok URL
+2. Update Twilio webhook URLs to the ngrok URL
+3. Restart the server
+
 ---
 
 ## Troubleshooting
 
-### Browser says "Speech recognition unavailable"
-- Use Chrome (best support for Web Speech API)
-- The page will automatically fall back to text input mode
-- For server-side fallback, install `openai-whisper`
+### Twilio says "Application error"
+- Check your server logs for errors
+- Verify your server is reachable at the webhook URL: `curl https://your-url/health`
+- Make sure `BASE_URL` in `.env` matches the URL Twilio is using
+- Check that `TWILIO_AUTH_TOKEN` is correct (wrong token = 403 on every request)
 
 ### Agent doesn't respond / Timeout
-- Check your server logs for errors
 - Verify your LLM API key is valid (check `LLM_PROVIDER` matches the key you set)
 - Test the `/health` endpoint: `curl https://your-url/health`
+- Check server logs for LLM API errors
 
-### No email notifications
-- Verify SMTP settings in `.env` (host, port, credentials)
-- For Gmail, use an App Password (not your regular password)
-- Check server logs for SMTP errors
-- Notifications are still visible on the dashboard even without email
+### No Telegram notifications
+- Verify `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`
+- Make sure you've sent at least one message to the bot first
+- Check server logs for Telegram API errors
+- Call history is still persisted to `data/call_history.jsonl` even without Telegram
 
-### Dashboard shows "Invalid API key"
-- Verify `DASHBOARD_API_KEY` in `.env` matches what you enter in the browser
-- The key is stored in your browser's localStorage — try logging out and back in
-
-### WebSocket connection fails
-- Ensure `BASE_URL` in `.env` matches your actual server URL
-- Check that your reverse proxy (if any) supports WebSocket upgrades
-- For local development, `localhost` and `127.0.0.1` are always allowed
+### Calls go to voicemail instead of Sophie
+- Verify call forwarding is set up on your carrier
+- Test by calling your Twilio number directly (bypassing forwarding)
+- Check the Twilio Console logs for incoming call events
 
 ---
 
@@ -441,9 +443,11 @@ See the **[AWS Deployment Guide](docs/AWS_DEPLOYMENT.md)** covering EC2, ECS Far
 | Service | Cost | Notes |
 |---------|------|-------|
 | **LLM (Claude/Grok/Gemini)** | ~$0.001–0.003 per 1K tokens | Varies by provider & model |
-| **SMTP Email** | Free (most providers) | Gmail, Outlook, etc. |
+| **Twilio Voice** | ~$0.013/min inbound + $0.0085/min outbound | US pricing; varies by country |
+| **Twilio Phone Number** | ~$1.15/month | US local number |
+| **Telegram Bot** | Free | No API costs |
 | **Hosting** | $0–$10/month | Free tier available on many platforms |
-| **Typical 3-min call** | ~$0.01–0.03 total | LLM tokens only |
+| **Typical 3-min call** | ~$0.05–0.08 total | LLM tokens + Twilio minutes |
 
 ---
 
