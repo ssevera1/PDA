@@ -26,7 +26,7 @@ class BaseLLMProvider(ABC):
 class ClaudeProvider(BaseLLMProvider):
     def __init__(self, api_key: str, model: str | None = None):
         self._client = anthropic.Anthropic(api_key=api_key)
-        self._model = model or "claude-sonnet-4-5-20250929"
+        self._model = model or "claude-sonnet-4-6"
 
     def complete(self, system: str, messages: list[dict], max_tokens: int = 300) -> str:
         response = self._client.messages.create(

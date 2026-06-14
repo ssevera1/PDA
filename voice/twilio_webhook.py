@@ -37,7 +37,7 @@ def _say(text: str) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
-    return f'<Say voice="Polly.Joanna-Neural">{safe}</Say>'
+    return f'<Say voice="Polly.Matthew-Neural">{safe}</Say>'
 
 
 def _gather_with_say(text: str, action_path: str, base_url: str) -> str:
