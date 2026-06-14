@@ -51,13 +51,19 @@ def _send_telegram_sync(text: str) -> None:
 
 async def send_call_summary(session: CallSession, summary: str) -> None:
     """Send a formatted call summary via Telegram."""
+    from config import get_settings
+    settings = get_settings()
+
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     location = f"{escape(session.caller_city or '?')}, {escape(session.caller_state or '?')}"
+    cost = max(0.0, (session.duration_seconds / 60) * settings.xai_voice_cost_per_minute)
+
     text = (
         f"<b>Incoming Call Report</b>\n\n"
         f"<b>From:</b> {escape(session.caller)}\n"
         f"<b>Location:</b> {location}\n"
         f"<b>Duration:</b> {escape(session.duration_display)}\n"
+        f"<b>Cost:</b> ~${cost:.4f} (est.)\n"
         f"<b>Time:</b> {escape(timestamp)}\n\n"
         f"<pre>{escape(summary)}</pre>"
     )

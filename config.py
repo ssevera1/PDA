@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     agent_name: str = "Sophie"
     owner_name: str = "Boss"
 
+    # xAI Voice Agent
+    xai_voice_model: str = "grok-voice-think-fast-1.0"
+    xai_voice_cost_per_minute: float = 0.05  # update from x.ai/api/voice pricing page
+
     # Server
     base_url: str = "http://localhost:8000"
 
