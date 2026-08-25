@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from config import get_settings
 from store.conversations import CallSession
 from agent.prompts import system_prompt, SUMMARY_PROMPT
@@ -11,7 +13,11 @@ async def respond(session: CallSession, caller_input: str) -> str:
     settings = get_settings()
     session.add_caller_message(caller_input)
 
-    reply = get_provider().complete(
+    # The provider SDKs are synchronous (network I/O plus internal retry
+    # backoff), so run them off the event loop — otherwise one slow request
+    # stalls every other concurrent call, including live media streams.
+    reply = await asyncio.to_thread(
+        get_provider().complete,
         system=system_prompt(settings.agent_name, settings.owner_name),
         messages=session.messages,
         max_tokens=300,
@@ -42,7 +48,8 @@ async def generate_greeting(session: CallSession) -> str:
         }
     ]
 
-    greeting = get_provider().complete(
+    greeting = await asyncio.to_thread(
+        get_provider().complete,
         system=system_prompt(settings.agent_name, settings.owner_name),
         messages=greeting_messages,
         max_tokens=150,
@@ -61,7 +68,8 @@ async def summarize_call(session: CallSession) -> str:
         role = "Caller" if msg["role"] == "user" else "Agent"
         conversation_text += f"{role}: {msg['content']}\n\n"
 
-    summary = get_provider().complete(
+    summary = await asyncio.to_thread(
+        get_provider().complete,
         system=SUMMARY_PROMPT,
         messages=[
             {
