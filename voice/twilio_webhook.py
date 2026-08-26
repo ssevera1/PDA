@@ -7,7 +7,7 @@ import logging
 import re
 
 from fastapi import APIRouter, Request, Response, HTTPException, WebSocket
-from fastapi.exceptions import WebSocketException
+from starlette.websockets import WebSocketDisconnect
 
 from twilio.request_validator import RequestValidator
 
@@ -71,17 +71,13 @@ async def incoming_call(request: Request):
     try:
         _verify_signature(request, form_data)
     except HTTPException as e:
+        # Fail closed: an unsigned/forged request must stay a 4xx so WAFs,
+        # alerting and rate limiters can still see spoofing attempts.
         logger.error(f"Signature verification failed: {e.detail}")
-        return _twiml(
-            '<Say voice="Polly.Matthew-Neural">Authentication failed.</Say>'
-            "<Hangup/>"
-        )
+        raise
     except Exception as e:
         logger.error(f"Signature verification error: {e}", exc_info=True)
-        return _twiml(
-            '<Say voice="Polly.Matthew-Neural">An error occurred. Please try again.</Say>'
-            "<Hangup/>"
-        )
+        return Response(status_code=500)
 
     try:
         settings = get_settings()
@@ -140,7 +136,13 @@ async def media_stream(websocket: WebSocket):
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError as e:
-                logger.error(f"Malformed JSON from Twilio: {e}", exc_info=True)
+                # No exc_info/ERROR here: a client spraying garbage would
+                # otherwise emit an unbounded stream of full tracebacks.
+                logger.warning(f"Malformed JSON from Twilio: {e}")
+                continue
+
+            if not isinstance(data, dict):
+                logger.warning(f"Non-object frame from Twilio: {type(data).__name__}")
                 continue
 
             event = data.get("event")
@@ -175,8 +177,9 @@ async def media_stream(websocket: WebSocket):
         )
         await bridge.run()
 
-    except WebSocketException as e:
-        logger.warning(f"WebSocket error for call {call_sid}: {e}")
+    except WebSocketDisconnect as e:
+        # Caller hung up — an expected end-of-call, not an error.
+        logger.warning(f"WebSocket disconnected for call {call_sid}: {e}")
     except Exception as e:
         logger.error(f"Media stream error for call {call_sid}: {e}", exc_info=True)
     finally:

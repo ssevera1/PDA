@@ -1,19 +1,21 @@
 """
-End-to-end integration tests — Twilio TwiML call flow.
+End-to-end integration tests — Twilio Media Streams call flow.
 
-Mocks: Twilio signature validation, LLM provider, Telegram send.
-Tests: Twilio webhook call lifecycle, turn limits, status callback,
-       invalid signature rejection, unknown session handling.
+Mocks: Twilio signature validation, LLM provider, Telegram send, xAI bridge.
+Tests: /voice/incoming TwiML, signature rejection, /voice/media-stream
+       handshake and error handling, /voice/status callback.
 """
 
 import json
+import logging
 import os
-import tempfile
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 from xml.etree import ElementTree as ET
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 
 # ---------------------------------------------------------------------------
@@ -27,6 +29,7 @@ os.environ.update(
         "TWILIO_PHONE_NUMBER": "+15550001111",
         "TELEGRAM_BOT_TOKEN": "",
         "TELEGRAM_CHAT_ID": "",
+        "XAI_API_KEY": "xai-test-fake-key",
         "AGENT_NAME": "Sophie",
         "OWNER_NAME": "TestBoss",
         "BASE_URL": "https://test.example.com",
@@ -35,12 +38,18 @@ os.environ.update(
     }
 )
 
+VOICE_LOGGER = "pdagent.voice"
+
 
 def _parse_twiml(response) -> ET.Element:
     """Parse a TwiML XML response into an ElementTree element."""
     assert response.status_code == 200
     assert "xml" in response.headers.get("content-type", "")
     return ET.fromstring(response.text)
+
+
+def _errors(records) -> list[logging.LogRecord]:
+    return [r for r in records if r.levelno >= logging.ERROR]
 
 
 @pytest.fixture(autouse=True)
@@ -56,10 +65,21 @@ def _temp_data_dir(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _mock_twilio_validation():
-    """Disable Twilio signature validation for all tests."""
+    """Accept every Twilio signature by default; tests opt out explicitly."""
     import voice.twilio_webhook  # ensure module is loaded before patching
-    with patch("voice.twilio_webhook._validate_twilio_signature"):
+
+    with patch("voice.twilio_webhook._verify_signature"):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """The rate limiter is a process-wide singleton — don't leak hits."""
+    from security import _limiter
+
+    _limiter._hits.clear()
+    yield
+    _limiter._hits.clear()
 
 
 @pytest.fixture
@@ -84,6 +104,14 @@ def client():
     reset_provider()
 
 
+@pytest.fixture
+def mock_post_call():
+    """Stub the post-call summary/notification hooks used by the finally block."""
+    with patch("voice.twilio_webhook.summarize_call", new=AsyncMock(return_value="s")), \
+         patch("voice.twilio_webhook.send_notifications", new=AsyncMock()):
+        yield
+
+
 # ===================================================================
 # TEST 1: Health check
 # ===================================================================
@@ -104,42 +132,9 @@ def test_root(client):
 
 
 # ===================================================================
-# TEST 3: Full call lifecycle via Twilio webhooks
+# TEST 3: Incoming call opens a Media Stream and creates a session
 # ===================================================================
-@patch("notifications.telegram._send_telegram_sync")
-@patch("agent.brain.get_provider")
-def test_full_call_lifecycle(mock_provider_fn, mock_telegram, client):
-    """Simulate: incoming -> greeting -> 2 gather turns -> goodbye -> summary."""
-    provider = MagicMock()
-    mock_provider_fn.return_value = provider
-    provider.complete.side_effect = [
-        # 1) Greeting
-        (
-            "Hi there! This is Sophie, I'm the assistant for TestBoss. "
-            "How can I help you today?"
-        ),
-        # 2) First caller turn
-        (
-            "Of course! Let me take a message for TestBoss. "
-            "Could I get your name and the best number to reach you?"
-        ),
-        # 3) Second caller turn — ends the call
-        (
-            "Got it, John. I'll make sure TestBoss gets your message "
-            "about the project deadline. He'll call you back at "
-            "five five five, eight seven six, five four three two. "
-            "Thanks for calling! CALL_COMPLETE"
-        ),
-        # 4) Post-call summary
-        (
-            "CALLER: John\n"
-            "CALLBACK: 555-876-5432\n"
-            "TOPIC: Project deadline question\n"
-            "ACTION_NEEDED: yes"
-        ),
-    ]
-
-    # Step 1: Incoming call
+def test_incoming_call_connects_stream(client):
     resp = client.post("/voice/incoming", data={
         "CallSid": "CA_TEST_001",
         "From": "+15559876543",
@@ -147,120 +142,275 @@ def test_full_call_lifecycle(mock_provider_fn, mock_telegram, client):
         "FromState": "TX",
     })
     root = _parse_twiml(resp)
-    gather = root.find("Gather")
-    assert gather is not None
-    say = gather.find("Say")
-    assert say is not None
-    assert "Sophie" in say.text
+    stream = root.find("Connect/Stream")
+    assert stream is not None
+    assert stream.get("url") == "wss://test.example.com/voice/media-stream"
 
-    # Step 2: First gather (caller speaks)
-    resp = client.post("/voice/gather", data={
-        "CallSid": "CA_TEST_001",
-        "SpeechResult": "Hi, I need to talk to TestBoss about a project deadline",
-    })
-    root = _parse_twiml(resp)
-    gather = root.find("Gather")
-    assert gather is not None
-    say = gather.find("Say")
-    assert say is not None
-    assert "CALL_COMPLETE" not in say.text
-
-    # Step 3: Second gather — triggers CALL_COMPLETE
-    resp = client.post("/voice/gather", data={
-        "CallSid": "CA_TEST_001",
-        "SpeechResult": "Sure, my name is John, call me back at 555-876-5432",
-    })
-    root = _parse_twiml(resp)
-    # Should have <Say> + <Hangup/>, no <Gather>
-    assert root.find("Gather") is None
-    hangup = root.find("Hangup")
-    assert hangup is not None
-    say = root.find("Say")
-    assert say is not None
-    assert "CALL_COMPLETE" not in say.text
-
-    # Provider called 4 times: greeting + 2 turns + summary
-    assert provider.complete.call_count == 4
-
-
-# ===================================================================
-# TEST 4: Turn limit enforcement
-# ===================================================================
-@patch("notifications.telegram._send_telegram_sync")
-@patch("agent.brain.get_provider")
-def test_turn_limit(mock_provider_fn, mock_telegram, client):
-    """Call should be ended after MAX_TURNS user messages."""
-    provider = MagicMock()
-    mock_provider_fn.return_value = provider
-    provider.complete.return_value = "Hello! How can I help?"
-
-    # Start the call
-    resp = client.post("/voice/incoming", data={
-        "CallSid": "CA_LIMIT_TEST",
-        "From": "+15550001234",
-    })
-    assert resp.status_code == 200
-
-    # Pre-fill session to the limit
     from store.conversations import store
-    session = store.get("CA_LIMIT_TEST")
+
+    session = store.get("CA_TEST_001")
     assert session is not None
-    for i in range(20):
-        session.add_caller_message(f"Turn {i}")
-        session.add_agent_message(f"Response {i}")
-
-    # Set up response for summary
-    provider.complete.return_value = "Summary of the call."
-
-    # Next gather should trigger turn limit
-    resp = client.post("/voice/gather", data={
-        "CallSid": "CA_LIMIT_TEST",
-        "SpeechResult": "One more thing...",
-    })
-    root = _parse_twiml(resp)
-    say = root.find("Say")
-    assert say is not None
-    assert "patience" in say.text
-    hangup = root.find("Hangup")
-    assert hangup is not None
+    assert session.caller == "+15559876543"
+    assert session.caller_city == "Dallas"
 
 
 # ===================================================================
-# TEST 5: Status callback — caller hung up
+# TEST 4: Invalid Twilio signature on /incoming is rejected with 403
+#
+# Regression: the handler must not convert a rejected signature into a
+# 200 OK TwiML response — forged requests have to stay visible as 4xx.
+# ===================================================================
+def test_invalid_signature_on_incoming_returns_403(client):
+    with patch("voice.twilio_webhook._verify_signature") as mock_verify:
+        mock_verify.side_effect = HTTPException(
+            status_code=403, detail="Invalid Twilio signature"
+        )
+
+        resp = client.post("/voice/incoming", data={
+            "CallSid": "CA_BAD_SIG",
+            "From": "+15550000000",
+        })
+
+    assert resp.status_code == 403
+
+    from store.conversations import store
+
+    assert store.get("CA_BAD_SIG") is None
+
+
+# ===================================================================
+# TEST 5: A signature validator blowing up must also fail closed
+# ===================================================================
+def test_signature_validator_crash_returns_500(client):
+    with patch("voice.twilio_webhook._verify_signature") as mock_verify:
+        mock_verify.side_effect = RuntimeError("validator exploded")
+
+        resp = client.post("/voice/incoming", data={
+            "CallSid": "CA_CRASH_SIG",
+            "From": "+15550000000",
+        })
+
+    assert resp.status_code == 500
+
+    from store.conversations import store
+
+    assert store.get("CA_CRASH_SIG") is None
+
+
+# ===================================================================
+# TEST 6: Invalid Twilio signature on /status is rejected with 403
+# ===================================================================
+def test_invalid_signature_on_status_returns_403(client):
+    with patch("voice.twilio_webhook._verify_signature") as mock_verify:
+        mock_verify.side_effect = HTTPException(
+            status_code=403, detail="Invalid Twilio signature"
+        )
+
+        resp = client.post("/voice/status", data={
+            "CallSid": "CA_BAD_SIG",
+            "CallStatus": "completed",
+        })
+
+    assert resp.status_code == 403
+
+
+# ===================================================================
+# TEST 7: Missing CallSid returns error TwiML, no session
+# ===================================================================
+def test_incoming_without_call_sid(client):
+    resp = client.post("/voice/incoming", data={"From": "+15550000000"})
+    root = _parse_twiml(resp)
+    assert root.find("Hangup") is not None
+    say = root.find("Say")
+    assert say is not None and "error" in say.text.lower()
+
+    from store.conversations import store
+
+    assert store.active_count() == 0
+
+
+# ===================================================================
+# TEST 8: Concurrency cap returns the busy message
+# ===================================================================
+def test_max_concurrent_calls(client):
+    from store.conversations import store
+    from voice.twilio_webhook import MAX_CONCURRENT_CALLS
+
+    for i in range(MAX_CONCURRENT_CALLS):
+        store.create(call_sid=f"CA_BUSY_{i}", caller="+15550000000")
+
+    resp = client.post("/voice/incoming", data={
+        "CallSid": "CA_OVERFLOW",
+        "From": "+15551234567",
+    })
+    root = _parse_twiml(resp)
+    say = root.find("Say")
+    assert say is not None and "busy" in say.text.lower()
+    assert root.find("Hangup") is not None
+    assert store.get("CA_OVERFLOW") is None
+
+
+# ===================================================================
+# TEST 9: Media stream handshake starts the bridge
+# ===================================================================
+def test_media_stream_starts_bridge(client, mock_post_call):
+    from store.conversations import store
+
+    store.create(call_sid="CA_WS_OK", caller="+15550001234")
+
+    bridge_instance = MagicMock()
+    bridge_instance.run = AsyncMock()
+
+    with patch("voice.twilio_webhook.XAIVoiceBridge", return_value=bridge_instance) as mock_cls:
+        with client.websocket_connect("/voice/media-stream") as ws:
+            ws.send_text(json.dumps({"event": "connected"}))
+            ws.send_text(json.dumps({
+                "event": "start",
+                "start": {"callSid": "CA_WS_OK", "streamSid": "MZ_1"},
+            }))
+
+    bridge_instance.run.assert_awaited_once()
+    assert mock_cls.call_args.kwargs["stream_sid"] == "MZ_1"
+    # finally block cleans the session up
+    assert store.get("CA_WS_OK") is None
+
+
+# ===================================================================
+# TEST 10: A caller hangup is a warning, not an error with a traceback
+#
+# Regression: WebSocketDisconnect is not a subclass of
+# fastapi.exceptions.WebSocketException, so catching the latter let every
+# hangup fall through to `except Exception` and log an ERROR + traceback.
+# ===================================================================
+def test_media_stream_disconnect_is_warning(client, mock_post_call, caplog):
+    from store.conversations import store
+
+    store.create(call_sid="CA_WS_BYE", caller="+15550001234")
+
+    bridge_instance = MagicMock()
+    bridge_instance.run = AsyncMock(side_effect=WebSocketDisconnect(code=1000))
+
+    with caplog.at_level(logging.DEBUG, logger=VOICE_LOGGER):
+        with patch("voice.twilio_webhook.XAIVoiceBridge", return_value=bridge_instance):
+            with client.websocket_connect("/voice/media-stream") as ws:
+                ws.send_text(json.dumps({"event": "connected"}))
+                ws.send_text(json.dumps({
+                    "event": "start",
+                    "start": {"callSid": "CA_WS_BYE", "streamSid": "MZ_2"},
+                }))
+
+    voice_records = [r for r in caplog.records if r.name == VOICE_LOGGER]
+    assert not _errors(voice_records), [r.getMessage() for r in _errors(voice_records)]
+    assert any(
+        r.levelno == logging.WARNING and "disconnected" in r.getMessage()
+        for r in voice_records
+    )
+    assert store.get("CA_WS_BYE") is None
+
+
+# ===================================================================
+# TEST 11: Malformed frames warn without a traceback and don't abort
+#
+# Regression: garbage frames used to be logged at ERROR with exc_info=True,
+# so a client spraying junk emitted unbounded full tracebacks.
+# ===================================================================
+def test_media_stream_malformed_frame_warns(client, mock_post_call, caplog):
+    from store.conversations import store
+
+    store.create(call_sid="CA_WS_JUNK", caller="+15550001234")
+
+    bridge_instance = MagicMock()
+    bridge_instance.run = AsyncMock()
+
+    with caplog.at_level(logging.DEBUG, logger=VOICE_LOGGER):
+        with patch("voice.twilio_webhook.XAIVoiceBridge", return_value=bridge_instance):
+            with client.websocket_connect("/voice/media-stream") as ws:
+                ws.send_text("}{ not json at all")
+                ws.send_text(json.dumps({
+                    "event": "start",
+                    "start": {"callSid": "CA_WS_JUNK", "streamSid": "MZ_3"},
+                }))
+
+    voice_records = [r for r in caplog.records if r.name == VOICE_LOGGER]
+    assert not _errors(voice_records), [r.getMessage() for r in _errors(voice_records)]
+    junk = [r for r in voice_records if "Malformed JSON" in r.getMessage()]
+    assert len(junk) == 1
+    assert junk[0].levelno == logging.WARNING
+    assert junk[0].exc_info is None
+    # The garbage frame did not abort the handshake
+    bridge_instance.run.assert_awaited_once()
+
+
+# ===================================================================
+# TEST 12: A valid-JSON non-object frame is skipped, not a crash
+# ===================================================================
+def test_media_stream_non_object_frame(client, mock_post_call, caplog):
+    from store.conversations import store
+
+    store.create(call_sid="CA_WS_SCALAR", caller="+15550001234")
+
+    bridge_instance = MagicMock()
+    bridge_instance.run = AsyncMock()
+
+    with caplog.at_level(logging.DEBUG, logger=VOICE_LOGGER):
+        with patch("voice.twilio_webhook.XAIVoiceBridge", return_value=bridge_instance):
+            with client.websocket_connect("/voice/media-stream") as ws:
+                ws.send_text(json.dumps(123))
+                ws.send_text(json.dumps({
+                    "event": "start",
+                    "start": {"callSid": "CA_WS_SCALAR", "streamSid": "MZ_4"},
+                }))
+
+    voice_records = [r for r in caplog.records if r.name == VOICE_LOGGER]
+    assert not _errors(voice_records), [r.getMessage() for r in _errors(voice_records)]
+    assert any("Non-object frame" in r.getMessage() for r in voice_records)
+    bridge_instance.run.assert_awaited_once()
+
+
+# ===================================================================
+# TEST 13: Media stream for an unknown session closes without a bridge
+# ===================================================================
+def test_media_stream_unknown_session(client, mock_post_call):
+    with patch("voice.twilio_webhook.XAIVoiceBridge") as mock_cls:
+        with client.websocket_connect("/voice/media-stream") as ws:
+            ws.send_text(json.dumps({
+                "event": "start",
+                "start": {"callSid": "CA_NOPE", "streamSid": "MZ_5"},
+            }))
+
+    mock_cls.assert_not_called()
+
+
+# ===================================================================
+# TEST 14: Status callback — caller hung up, summary is generated
 # ===================================================================
 @patch("notifications.telegram._send_telegram_sync")
 @patch("agent.brain.get_provider")
 def test_status_callback_hangup(mock_provider_fn, mock_telegram, client, _temp_data_dir):
-    """Summary should be generated when caller hangs up mid-call."""
     provider = MagicMock()
     mock_provider_fn.return_value = provider
-    provider.complete.side_effect = [
-        "Hi! How can I help?",
-        "I'll take a message.",
-        "Summary of the call.",
-    ]
+    provider.complete.return_value = "Summary of the call."
 
-    # Start call and do one turn
     client.post("/voice/incoming", data={
         "CallSid": "CA_HANGUP_TEST",
         "From": "+15559999999",
     })
-    client.post("/voice/gather", data={
-        "CallSid": "CA_HANGUP_TEST",
-        "SpeechResult": "I need to leave a message",
-    })
 
-    # Status callback — caller hung up
+    from store.conversations import store
+
+    session = store.get("CA_HANGUP_TEST")
+    assert session is not None
+    session.add_caller_message("I need to leave a message")
+    session.add_agent_message("Sure, I'll take one.")
+
     resp = client.post("/voice/status", data={
         "CallSid": "CA_HANGUP_TEST",
         "CallStatus": "completed",
     })
     assert resp.status_code == 204
+    assert provider.complete.call_count == 1
+    assert store.get("CA_HANGUP_TEST") is None
 
-    # Summary should have been generated (3 calls: greeting + turn + summary)
-    assert provider.complete.call_count == 3
-
-    # Verify call was persisted
     history_path = os.path.join(str(_temp_data_dir), "call_history.jsonl")
     assert os.path.exists(history_path)
     with open(history_path) as f:
@@ -270,46 +420,9 @@ def test_status_callback_hangup(mock_provider_fn, mock_telegram, client, _temp_d
 
 
 # ===================================================================
-# TEST 6: Invalid Twilio signature is rejected
-# ===================================================================
-def test_invalid_twilio_signature(client):
-    """Requests with invalid signatures should be rejected with 403."""
-    # Remove the autouse mock for this test by directly calling
-    # the real validation
-    with patch("voice.twilio_webhook._validate_twilio_signature") as mock_validate:
-        mock_validate.side_effect = __import__(
-            "fastapi", fromlist=["HTTPException"]
-        ).HTTPException(status_code=403, detail="Invalid Twilio signature")
-
-        resp = client.post("/voice/incoming", data={
-            "CallSid": "CA_BAD_SIG",
-            "From": "+15550000000",
-        })
-        assert resp.status_code == 403
-
-
-# ===================================================================
-# TEST 7: Gather for unknown session
-# ===================================================================
-@patch("agent.brain.get_provider")
-def test_unknown_session_gather(mock_provider_fn, client):
-    """Gather for a non-existent session should return error TwiML."""
-    resp = client.post("/voice/gather", data={
-        "CallSid": "CA_DOES_NOT_EXIST",
-        "SpeechResult": "Hello?",
-    })
-    root = _parse_twiml(resp)
-    say = root.find("Say")
-    assert say is not None
-    assert "wrong" in say.text.lower()
-    assert root.find("Hangup") is not None
-
-
-# ===================================================================
-# TEST 8: Status callback for already-cleaned session (no-op)
+# TEST 15: Status callback for already-cleaned session (no-op)
 # ===================================================================
 def test_status_callback_noop(client):
-    """Status callback for unknown session should return 204 silently."""
     resp = client.post("/voice/status", data={
         "CallSid": "CA_ALREADY_DONE",
         "CallStatus": "completed",
@@ -318,7 +431,15 @@ def test_status_callback_noop(client):
 
 
 # ===================================================================
-# TEST 9: Rate limiting
+# TEST 16: Status callback without a CallSid is a no-op 204
+# ===================================================================
+def test_status_callback_without_call_sid(client):
+    resp = client.post("/voice/status", data={"CallStatus": "completed"})
+    assert resp.status_code == 204
+
+
+# ===================================================================
+# TEST 17: Rate limiting
 # ===================================================================
 def test_rate_limiting(client):
     """Rate limiter should block after threshold."""
@@ -337,7 +458,7 @@ def test_rate_limiting(client):
 
 
 # ===================================================================
-# TEST 10: Session cleanup
+# TEST 18: Session cleanup
 # ===================================================================
 def test_stale_session_cleanup():
     """Stale sessions should be identified and removed."""
@@ -368,32 +489,6 @@ def test_stale_session_cleanup():
     assert store.get("CA_OLD") is None
 
     store._sessions.clear()
-
-
-# ===================================================================
-# TEST 11: Empty speech re-prompts
-# ===================================================================
-@patch("agent.brain.get_provider")
-def test_empty_speech_reprompts(mock_provider_fn, client):
-    """Empty SpeechResult should re-prompt instead of crashing."""
-    provider = MagicMock()
-    mock_provider_fn.return_value = provider
-    provider.complete.return_value = "Hello! How can I help?"
-
-    client.post("/voice/incoming", data={
-        "CallSid": "CA_EMPTY_SPEECH",
-        "From": "+15551112222",
-    })
-
-    resp = client.post("/voice/gather", data={
-        "CallSid": "CA_EMPTY_SPEECH",
-        "SpeechResult": "",
-    })
-    root = _parse_twiml(resp)
-    gather = root.find("Gather")
-    assert gather is not None
-    say = gather.find("Say")
-    assert "didn't catch" in say.text.lower()
 
 
 if __name__ == "__main__":
