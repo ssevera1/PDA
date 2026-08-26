@@ -29,7 +29,11 @@ jobs:
 
       - name: pytest
         run: |
-          if ! ls test_*.py *_test.py 2>/dev/null 1>&2 && [ ! -d tests ]; then
+          # `ls a b` exits non-zero when *any* pattern misses, so the old
+          # `ls test_*.py *_test.py` guard always reported "no tests".
+          if ! compgen -G "test_*.py" > /dev/null \
+             && ! compgen -G "*_test.py" > /dev/null \
+             && [ ! -d tests ]; then
             echo "::warning::No tests found in this repository; nothing to run."
             exit 0
           fi
