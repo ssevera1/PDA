@@ -15,10 +15,20 @@ class CallSession:
     needs_escalation: bool = False
     summary: str | None = None
 
+    def __post_init__(self) -> None:
+        if not self.call_sid or not isinstance(self.call_sid, str):
+            raise ValueError("call_sid must be a non-empty string")
+        if not self.caller or not isinstance(self.caller, str):
+            raise ValueError("caller must be a non-empty string")
+
     def add_caller_message(self, text: str) -> None:
+        if not text or not isinstance(text, str):
+            raise ValueError("message text must be a non-empty string")
         self.messages.append({"role": "user", "content": text})
 
     def add_agent_message(self, text: str) -> None:
+        if not text or not isinstance(text, str):
+            raise ValueError("message text must be a non-empty string")
         self.messages.append({"role": "assistant", "content": text})
 
     @property
@@ -39,6 +49,10 @@ class ConversationStore:
         self._sessions: dict[str, CallSession] = {}
 
     def create(self, call_sid: str, caller: str, **kwargs) -> CallSession:
+        if not call_sid or not isinstance(call_sid, str):
+            raise ValueError("call_sid must be a non-empty string")
+        if not caller or not isinstance(caller, str):
+            raise ValueError("caller must be a non-empty string")
         session = CallSession(call_sid=call_sid, caller=caller, **kwargs)
         self._sessions[call_sid] = session
         return session
