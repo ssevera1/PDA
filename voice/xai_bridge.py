@@ -1,4 +1,4 @@
-"""WebSocket bridge between Twilio Media Streams and xAI Voice Agent."""
+"""WebSocket bridge between Twilio Media Streams and the xAI Voice Agent."""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ from websockets.asyncio.client import connect as ws_connect
 
 from config import get_settings
 from store.conversations import CallSession
-from agent.prompts import system_prompt
+from agent.prompts import system_prompt, load_knowledge
+from voice.tools import TOOL_DEFINITIONS, dispatch
 
 logger = logging.getLogger("pdagent.xai_bridge")
 
@@ -18,13 +19,23 @@ _XAI_REALTIME_URL = "wss://api.x.ai/v1/realtime"
 
 
 class XAIVoiceBridge:
-    """Bridges μ-law audio between a Twilio Media Stream and xAI Voice Agent."""
+    """Bridges u-law audio between a Twilio Media Stream and the xAI Voice Agent.
+
+    The model's function calls are executed here (voice/tools.py) — this
+    process is the tool runtime, which is why a server-side bridge exists at
+    all instead of pointing Twilio straight at xAI over SIP.
+    """
 
     def __init__(self, twilio_ws, session: CallSession, stream_sid: str):
         self._twilio = twilio_ws
         self._session = session
         self._stream_sid = stream_sid
         self._ending = False
+        # Cumulative-transcript bookkeeping: xAI's
+        # conversation.item.input_audio_transcription.updated events carry the
+        # whole transcript-so-far for an item (with corrections), so the last
+        # stored caller message is replaced, not appended, per item.
+        self._caller_item_id: str | None = None
 
     async def run(self) -> None:
         settings = get_settings()
@@ -55,18 +66,12 @@ class XAIVoiceBridge:
 
     async def _configure_session(self, xai_ws) -> None:
         settings = get_settings()
-
-        # Replace text-sentinel ending instructions with function-call instruction
-        base = system_prompt(settings.agent_name, settings.owner_name)
-        if "## Ending the Call" in base:
-            prompt = base.split("## Ending the Call")[0].rstrip()
-        else:
-            prompt = base
-        prompt += (
-            "\n\n## Ending the Call\n"
-            "When the conversation is complete and you have said your goodbye, "
-            "call the end_call function. Never mention the function to the caller."
-        )
+        knowledge = load_knowledge(settings.knowledge_path)
+        if knowledge is None:
+            logger.warning(
+                "knowledge pack missing — run scripts/build_knowledge.py; using the safe fallback"
+            )
+        prompt = system_prompt(settings.agent_name, settings.owner_name, knowledge=knowledge)
 
         location = ""
         if self._session.caller_city:
@@ -77,19 +82,14 @@ class XAIVoiceBridge:
         await xai_ws.send(json.dumps({
             "type": "session.update",
             "session": {
-                "voice": "rex",
+                "voice": settings.xai_voice.lower(),
                 "instructions": prompt,
                 "turn_detection": {"type": "server_vad"},
                 "audio": {
                     "input": {"format": {"type": "audio/pcmu"}},
                     "output": {"format": {"type": "audio/pcmu"}},
                 },
-                "tools": [{
-                    "type": "function",
-                    "name": "end_call",
-                    "description": "End the phone call after saying goodbye to the caller.",
-                    "parameters": {"type": "object", "properties": {}, "required": []},
-                }],
+                "tools": TOOL_DEFINITIONS,
             }
         }))
 
@@ -107,6 +107,54 @@ class XAIVoiceBridge:
                     ),
                 }],
             }
+        }))
+        await xai_ws.send(json.dumps({"type": "response.create"}))
+
+    def _record_caller_transcript(self, item_id: str | None, text: str) -> None:
+        text = text.strip()
+        if not text:
+            return
+        if item_id is not None and item_id == self._caller_item_id and self._session.messages:
+            last = self._session.messages[-1]
+            if last.get("role") == "user":
+                last["content"] = text
+                return
+        self._session.add_caller_message(text)
+        self._caller_item_id = item_id
+
+    async def _handle_function_call(self, xai_ws, event: dict) -> None:
+        name = event.get("name", "")
+        call_id = event.get("call_id")
+        if name == "end_call":
+            self._ending = True
+            await xai_ws.send(json.dumps({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": "ok",
+                },
+            }))
+            await xai_ws.send(json.dumps({
+                "type": "response.create",
+                "response": {"instructions": "Say a warm, brief goodbye."},
+            }))
+            return
+
+        try:
+            args = json.loads(event.get("arguments") or "{}")
+            if not isinstance(args, dict):
+                args = {}
+        except json.JSONDecodeError:
+            args = {}
+        output = await dispatch(name, args, self._session)
+        await xai_ws.send(json.dumps({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            },
         }))
         await xai_ws.send(json.dumps({"type": "response.create"}))
 
@@ -141,38 +189,31 @@ class XAIVoiceBridge:
                     }))
 
                 elif etype == "input_audio_buffer.speech_started":
-                    # Caller interrupted — clear Twilio's outbound audio queue
                     await self._twilio.send_text(json.dumps({
                         "event": "clear",
                         "streamSid": self._stream_sid,
                     }))
 
+                elif etype == "conversation.item.input_audio_transcription.updated":
+                    # Current xAI naming: cumulative transcript with corrections.
+                    self._record_caller_transcript(
+                        event.get("item_id"), event.get("transcript", "")
+                    )
+
                 elif etype == "conversation.item.input_audio_transcription.completed":
-                    text = event.get("transcript", "").strip()
-                    if text:
-                        self._session.add_caller_message(text)
+                    # Legacy/compat naming — same replace-then-append handling.
+                    self._record_caller_transcript(
+                        event.get("item_id"), event.get("transcript", "")
+                    )
 
                 elif etype == "response.audio_transcript.done":
                     text = event.get("transcript", "").strip()
                     if text:
                         self._session.add_agent_message(text)
+                        self._caller_item_id = None
 
                 elif etype == "response.function_call_arguments.done":
-                    if event.get("name") == "end_call":
-                        self._ending = True
-                        # Acknowledge the function call and request a goodbye
-                        await xai_ws.send(json.dumps({
-                            "type": "conversation.item.create",
-                            "item": {
-                                "type": "function_call_output",
-                                "call_id": event["call_id"],
-                                "output": "ok",
-                            }
-                        }))
-                        await xai_ws.send(json.dumps({
-                            "type": "response.create",
-                            "response": {"instructions": "Say a warm, brief goodbye."},
-                        }))
+                    await self._handle_function_call(xai_ws, event)
 
                 elif etype == "response.done" and self._ending:
                     logger.info(f"Call complete via end_call for {self._session.call_sid}")

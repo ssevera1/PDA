@@ -119,3 +119,18 @@ mid-call Claude consultations, multi-calendar support.
 
 xAI API key; one-time Google OAuth consent (script provided); ngrok authtoken if
 not already configured; one test call.
+
+
+## Addendum (same day): calendar backend is Microsoft Graph
+
+Scott's mail and calendar are Exchange Online (GoDaddy-managed Microsoft 365,
+scott@scottseverance.net), not Google. The scheduling tools now go through a
+backend facade (integrations/calendar_api.py) defaulting to Microsoft Graph
+(integrations/mscal.py): device-code sign-in via scripts/ms_auth.py reusing
+the app registration career-ops' scan-email.mjs already uses on this mailbox
+(client id and tenant borrowed automatically from the career-ops .env),
+delegated Calendars.ReadWrite, refresh token at data/ms-token.json, free/busy
+via /me/calendarView (free and cancelled events do not block), holds via
+/me/events with showAs tentative in America/Chicago. The Google backend and
+its consent script remain available behind calendar_backend=google. Google
+Cloud Console setup is no longer required.

@@ -89,7 +89,7 @@ def test_openai_complete_raises_on_connection_error():
 def test_complete_never_returns_none_for_any_retry_budget(monkeypatch, max_retries):
     """Regression: a retry loop whose exhausted path has no explicit raise
     returns None once the budget is reconfigured, and that None only blows up
-    later in brain.respond (`"CALL_COMPLETE" in reply`)."""
+    by callers of the provider."""
     monkeypatch.setattr(llm, "_MAX_RETRIES", max_retries)
 
     with patch.object(llm.anthropic, "Anthropic") as ctor:
@@ -110,9 +110,12 @@ def test_complete_never_returns_none_for_any_retry_budget(monkeypatch, max_retri
 
 def test_claude_complete_returns_text():
     with patch.object(llm.anthropic, "Anthropic") as ctor:
+        thinking = MagicMock()
+        thinking.type = "thinking"  # Opus 5 thinks adaptively; text extraction must skip this
         block = MagicMock()
+        block.type = "text"
         block.text = "hello"
-        ctor.return_value.messages.create.return_value.content = [block]
+        ctor.return_value.messages.create.return_value.content = [thinking, block]
         provider = llm.ClaudeProvider(api_key="sk-test")
 
         assert provider.complete(system="s", messages=[]) == "hello"
@@ -193,34 +196,3 @@ def test_summarize_call_does_not_block_the_event_loop():
     assert ticks >= 10, f"event loop was blocked during the provider call ({ticks} ticks)"
 
 
-def test_respond_does_not_block_the_event_loop(monkeypatch):
-    from config import get_settings
-
-    for key, value in {
-        "ANTHROPIC_API_KEY": "sk-ant-test",
-        "TWILIO_ACCOUNT_SID": "ACtest123",
-        "TWILIO_AUTH_TOKEN": "test-auth-token",
-        "TWILIO_PHONE_NUMBER": "+15550001111",
-        "BASE_URL": "https://test.example.com",
-        "ENVIRONMENT": "development",
-    }.items():
-        monkeypatch.setenv(key, value)
-    get_settings.cache_clear()  # settings are lru_cached; pick up the env above
-
-    provider = MagicMock()
-
-    def slow_complete(**kwargs):
-        time.sleep(_BLOCKING_SECONDS)
-        return "Sure thing."
-
-    provider.complete.side_effect = slow_complete
-    session = CallSession(call_sid="CA_BLOCK2", caller="+15550000000")
-
-    with patch("agent.brain.get_provider", return_value=provider):
-        from agent.brain import respond
-
-        reply, ticks = _run_with_ticker(lambda: respond(session, "hello?"))
-
-    get_settings.cache_clear()  # don't leak this env into other tests
-    assert reply == "Sure thing."
-    assert ticks >= 10, f"event loop was blocked during the provider call ({ticks} ticks)"

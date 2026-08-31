@@ -14,6 +14,11 @@ class CallSession:
     messages: list[dict[str, str]] = field(default_factory=list)
     needs_escalation: bool = False
     summary: str | None = None
+    # v4 scheduling + extraction state
+    proposed_slots: dict = field(default_factory=dict)  # start_iso -> spoken form
+    slot_held: str | None = None  # ISO start of a booked tentative hold
+    extract: dict | None = None  # structured post-call extract
+    finalized: bool = False  # set once, before the first await of post-call work
 
     def __post_init__(self) -> None:
         if not self.call_sid or not isinstance(self.call_sid, str):

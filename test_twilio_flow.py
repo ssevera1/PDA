@@ -41,6 +41,13 @@ os.environ.update(
 VOICE_LOGGER = "pdagent.voice"
 
 
+def _ws_url(call_sid: str) -> str:
+    """Connect URL carrying a freshly minted single-use stream token."""
+    from voice import stream_tokens
+
+    return f"/voice/media-stream?t={stream_tokens.mint(call_sid)}"
+
+
 def _parse_twiml(response) -> ET.Element:
     """Parse a TwiML XML response into an ElementTree element."""
     assert response.status_code == 200
@@ -145,6 +152,9 @@ def test_incoming_call_connects_stream(client):
     stream = root.find("Connect/Stream")
     assert stream is not None
     assert stream.get("url") == "wss://test.example.com/voice/media-stream"
+    param = stream.find("Parameter")
+    assert param is not None and param.get("name") == "t"
+    assert len(param.get("value")) >= 20  # single-use stream token, via <Parameter> (Twilio drops query strings)
 
     from store.conversations import store
 
@@ -262,7 +272,7 @@ def test_media_stream_starts_bridge(client, mock_post_call):
     bridge_instance.run = AsyncMock()
 
     with patch("voice.twilio_webhook.XAIVoiceBridge", return_value=bridge_instance) as mock_cls:
-        with client.websocket_connect("/voice/media-stream") as ws:
+        with client.websocket_connect(_ws_url("CA_WS_OK")) as ws:
             ws.send_text(json.dumps({"event": "connected"}))
             ws.send_text(json.dumps({
                 "event": "start",
@@ -292,7 +302,7 @@ def test_media_stream_disconnect_is_warning(client, mock_post_call, caplog):
 
     with caplog.at_level(logging.DEBUG, logger=VOICE_LOGGER):
         with patch("voice.twilio_webhook.XAIVoiceBridge", return_value=bridge_instance):
-            with client.websocket_connect("/voice/media-stream") as ws:
+            with client.websocket_connect(_ws_url("CA_WS_BYE")) as ws:
                 ws.send_text(json.dumps({"event": "connected"}))
                 ws.send_text(json.dumps({
                     "event": "start",
@@ -324,7 +334,7 @@ def test_media_stream_malformed_frame_warns(client, mock_post_call, caplog):
 
     with caplog.at_level(logging.DEBUG, logger=VOICE_LOGGER):
         with patch("voice.twilio_webhook.XAIVoiceBridge", return_value=bridge_instance):
-            with client.websocket_connect("/voice/media-stream") as ws:
+            with client.websocket_connect(_ws_url("CA_WS_JUNK")) as ws:
                 ws.send_text("}{ not json at all")
                 ws.send_text(json.dumps({
                     "event": "start",
@@ -354,7 +364,7 @@ def test_media_stream_non_object_frame(client, mock_post_call, caplog):
 
     with caplog.at_level(logging.DEBUG, logger=VOICE_LOGGER):
         with patch("voice.twilio_webhook.XAIVoiceBridge", return_value=bridge_instance):
-            with client.websocket_connect("/voice/media-stream") as ws:
+            with client.websocket_connect(_ws_url("CA_WS_SCALAR")) as ws:
                 ws.send_text(json.dumps(123))
                 ws.send_text(json.dumps({
                     "event": "start",
@@ -372,7 +382,7 @@ def test_media_stream_non_object_frame(client, mock_post_call, caplog):
 # ===================================================================
 def test_media_stream_unknown_session(client, mock_post_call):
     with patch("voice.twilio_webhook.XAIVoiceBridge") as mock_cls:
-        with client.websocket_connect("/voice/media-stream") as ws:
+        with client.websocket_connect(_ws_url("CA_NOPE")) as ws:
             ws.send_text(json.dumps({
                 "event": "start",
                 "start": {"callSid": "CA_NOPE", "streamSid": "MZ_5"},
