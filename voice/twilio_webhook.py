@@ -16,6 +16,7 @@ from store.conversations import store
 from agent.brain import summarize_call
 from notifications.dispatcher import send_notifications
 from voice.xai_bridge import XAIVoiceBridge
+from voice import stream_tokens
 
 logger = logging.getLogger("pdagent.voice")
 
@@ -101,15 +102,50 @@ async def incoming_call(request: Request):
         logger.info(f"Incoming call created: {call_sid} from {caller}")
 
         ws_base = settings.base_url.replace("https://", "wss://").replace("http://", "ws://")
+        token = stream_tokens.mint(call_sid)
+        # Twilio does not forward a query string on the Stream URL; the
+        # documented channel for per-call data is a <Parameter>, delivered in
+        # the start event as customParameters (query param kept as fallback
+        # for direct/test clients).
         stream_url = f"{ws_base}/voice/media-stream"
 
-        return _twiml(f'<Connect><Stream url="{stream_url}"/></Connect>')
+        return _twiml(
+            f'<Connect><Stream url="{stream_url}">'
+            f'<Parameter name="t" value="{token}"/>'
+            f"</Stream></Connect>"
+        )
     except Exception as e:
         logger.error(f"Incoming call handler error: {e}", exc_info=True)
         return _twiml(
             '<Say voice="Polly.Matthew-Neural">An error occurred. Please try again.</Say>'
             "<Hangup/>"
         )
+
+
+async def _finalize_call(call_sid: str | None, session) -> None:
+    """Summarize + notify + remove, exactly once per call.
+
+    Both the media-stream ``finally`` block and Twilio's status callback reach
+    here, usually within a second of each other. The ``finalized`` flag is set
+    synchronously BEFORE the first await, and both callers run on the same
+    event loop, so the second arrival sees it and returns — the live test
+    call on 2026-08-30 produced doubled Telegram reports and inbox notes
+    without this.
+    """
+    if session is None or session.finalized:
+        return
+    session.finalized = True
+    try:
+        if session.messages:
+            summary = await summarize_call(session)
+            await send_notifications(session, summary)
+    except Exception as e:
+        logger.error(f"Post-call summary failed for {call_sid}: {e}", exc_info=True)
+    finally:
+        try:
+            store.remove(call_sid)
+        except Exception as e:
+            logger.error(f"Failed to remove session {call_sid}: {e}", exc_info=True)
 
 
 @router.websocket("/media-stream")
@@ -157,6 +193,16 @@ async def media_stream(websocket: WebSocket):
                     await websocket.close(code=1002, reason="Invalid start event")
                     return
 
+                # The stream must present the single-use token the webhook
+                # minted for exactly this call — a guessed WebSocket URL, a
+                # replayed token, or a token for another call is refused.
+                custom = data["start"].get("customParameters") or {}
+                presented = custom.get("t") or websocket.query_params.get("t")
+                if not stream_tokens.consume(presented, call_sid):
+                    logger.warning(f"Media stream token invalid for {call_sid} — refusing bridge")
+                    await websocket.close(code=1008, reason="Invalid stream token")
+                    return
+
                 session = store.get(call_sid)
                 break
 
@@ -184,15 +230,7 @@ async def media_stream(websocket: WebSocket):
         logger.error(f"Media stream error for call {call_sid}: {e}", exc_info=True)
     finally:
         if session:
-            try:
-                summary = await summarize_call(session)
-                await send_notifications(session, summary)
-            except Exception as e:
-                logger.error(f"Post-call summary failed for {call_sid}: {e}", exc_info=True)
-            try:
-                store.remove(call_sid)
-            except Exception as e:
-                logger.error(f"Failed to remove session {call_sid}: {e}", exc_info=True)
+            await _finalize_call(call_sid, session)
         else:
             if call_sid:
                 logger.warning(f"Media stream closed without session for {call_sid}")
@@ -232,14 +270,7 @@ async def call_status(request: Request):
             logger.debug(f"Status callback for unknown session {call_sid} — already cleaned up")
             return Response(status_code=204)
 
-        if session.messages:
-            try:
-                summary = await summarize_call(session)
-                await send_notifications(session, summary)
-            except Exception as e:
-                logger.error(f"Status-callback summary failed for {call_sid}: {e}", exc_info=True)
-
-        store.remove(call_sid)
+        await _finalize_call(call_sid, session)
     except Exception as e:
         logger.error(f"Status callback handler error for {call_sid}: {e}", exc_info=True)
 

@@ -1,84 +1,98 @@
+"""Post-call intelligence. The live conversation happens inside the xAI voice
+session; this module only runs after (or as) a call ends: one Claude pass that
+produces a structured extract plus the human-readable Telegram report.
+
+The v2 turn-by-turn webhook path (``respond`` / ``generate_greeting``) is gone
+with the architecture that needed it.
+"""
+
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
+import re
 
-from config import get_settings
 from store.conversations import CallSession
-from agent.prompts import system_prompt, SUMMARY_PROMPT
+from agent.prompts import EXTRACT_PROMPT
 from agent.llm import get_provider
 
+logger = logging.getLogger("pdagent.brain")
 
-async def respond(session: CallSession, caller_input: str) -> str:
-    """Generate a conversational response to the caller's latest input."""
-    settings = get_settings()
-    session.add_caller_message(caller_input)
-
-    # The provider SDKs are synchronous (network I/O plus internal retry
-    # backoff), so run them off the event loop — otherwise one slow request
-    # stalls every other concurrent call, including live media streams.
-    reply = await asyncio.to_thread(
-        get_provider().complete,
-        system=system_prompt(settings.agent_name, settings.owner_name),
-        messages=session.messages,
-        max_tokens=300,
-    )
-
-    session.add_agent_message(reply)
-
-    # Check if agent wants to escalate
-    if "CALL_COMPLETE" in reply:
-        session.needs_escalation = True
-
-    return reply
+_REPORT_FIELDS = [
+    ("caller_type", "Type"),
+    ("caller_name", "Caller"),
+    ("company", "Company"),
+    ("role", "Role"),
+    ("comp_range", "Comp"),
+    ("location_policy", "Location"),
+    ("callback_phone", "Callback"),
+    ("email", "Email"),
+    ("timeline", "Timeline"),
+    ("slot_held", "Slot held"),
+    ("urgency", "Urgency"),
+    ("action_needed", "Action"),
+]
 
 
-async def generate_greeting(session: CallSession) -> str:
-    """Generate the initial greeting for a new call."""
-    settings = get_settings()
+def parse_extract(raw: str) -> dict | None:
+    """The model's JSON, tolerantly parsed. None when it isn't JSON at all."""
+    text = raw.strip()
+    text = re.sub(r"^```[a-z]*\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
-    greeting_messages = [
-        {
-            "role": "user",
-            "content": (
-                f"A caller is on the line from number {session.caller}. "
-                f"Location: {session.caller_city or 'unknown'}, "
-                f"{session.caller_state or 'unknown'}. "
-                "Please greet them warmly and ask how you can help."
-            ),
-        }
-    ]
 
-    greeting = await asyncio.to_thread(
-        get_provider().complete,
-        system=system_prompt(settings.agent_name, settings.owner_name),
-        messages=greeting_messages,
-        max_tokens=150,
-    )
-
-    # Store the greeting exchange in session history
-    session.messages.extend(greeting_messages)
-    session.add_agent_message(greeting)
-    return greeting
+def render_report(extract: dict) -> str:
+    """The Telegram-facing report for a parsed extract."""
+    lines = []
+    for key, label in _REPORT_FIELDS:
+        value = extract.get(key)
+        if value in (None, "", []):
+            continue
+        lines.append(f"{label}: {value}")
+    flags = extract.get("red_flags") or []
+    if flags:
+        lines.append("Red flags: " + "; ".join(str(f) for f in flags))
+    summary = extract.get("summary")
+    if summary:
+        lines.append("")
+        lines.append(str(summary))
+    return "\n".join(lines) if lines else "No details extracted."
 
 
 async def summarize_call(session: CallSession) -> str:
-    """Generate a structured summary of the completed call."""
-    conversation_text = ""
-    for msg in session.messages:
-        role = "Caller" if msg["role"] == "user" else "Agent"
-        conversation_text += f"{role}: {msg['content']}\n\n"
+    """Structured extract + report. Sets ``session.extract`` when parseable."""
+    if not session.messages:
+        session.summary = "No conversation captured."
+        return session.summary
 
-    summary = await asyncio.to_thread(
-        get_provider().complete,
-        system=SUMMARY_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": f"Here is the call transcript:\n\n{conversation_text}",
-            }
-        ],
-        max_tokens=500,
+    transcript = "\n\n".join(
+        f"{'Caller' if m['role'] == 'user' else 'Agent'}: {m['content']}" for m in session.messages
     )
+    if session.slot_held:
+        transcript += f"\n\n[SYSTEM: a tentative hold was booked for {session.slot_held}]"
 
-    session.summary = summary
-    return summary
+    raw = await asyncio.to_thread(
+        get_provider().complete,
+        system=EXTRACT_PROMPT,
+        messages=[{"role": "user", "content": f"Here is the call transcript:\n\n{transcript}"}],
+        max_tokens=1000,
+    )
+    extract = parse_extract(raw)
+    if extract is not None:
+        if session.slot_held and not extract.get("slot_held"):
+            extract["slot_held"] = session.slot_held
+        session.extract = extract
+        session.summary = render_report(extract)
+    else:
+        logger.warning(f"extract was not valid JSON for {session.call_sid}; using raw text")
+        session.summary = raw.strip()[:4000]
+    return session.summary

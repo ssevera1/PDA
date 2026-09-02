@@ -80,3 +80,14 @@ async def send_urgent_alert(session: CallSession, reason: str) -> None:
         "Please call back ASAP."
     )
     await asyncio.to_thread(_send_telegram_sync, text)
+
+
+async def send_live(text: str) -> None:
+    """Plain-text live notification used by in-call tools. Errors are logged,
+    never raised — a Telegram hiccup must not disturb a live call."""
+    from html import escape as _esc
+
+    try:
+        await asyncio.to_thread(_send_telegram_sync, _esc(text))
+    except Exception:
+        logger.exception("live Telegram notification failed")

@@ -33,12 +33,12 @@ An AI-powered personal assistant that handles your phone calls via Twilio using 
 
 1. Someone calls your real phone number
 2. Your carrier forwards the call to your Twilio number
-3. Twilio hits your server's `/voice/incoming` webhook
-4. Sophie greets the caller and begins a conversation via TwiML `<Say>` + `<Gather>`
-5. Each time the caller speaks, Twilio transcribes it and sends it to `/voice/gather`
-6. The LLM generates a response, which Twilio speaks back to the caller
-7. When the call ends (naturally or via hangup), the LLM summarizes the conversation
-8. You receive a Telegram notification with the full call report
+3. Twilio hits `/voice/incoming` (signature-checked) and opens a Media Stream to this server
+4. The server bridges the raw audio to xAI's Grok Voice Agent (`grok-voice-latest`) over a realtime WebSocket: one speech-to-speech model, sub-second turns, natural barge-in
+5. Mid-call, the model can use real tools executed by the bridge: check the owner's calendar (Microsoft 365/Exchange by default, Google optional) and offer open slots, place a tentative hold, send the owner a live Telegram note, or look up whether the caller's company is already in the owner's job-search pipeline
+6. Sophie's facts about the owner come from a compiled, validated knowledge pack (`scripts/build_knowledge.py`), never from hand-written prompt claims
+7. When the call ends, Claude produces a structured extract and summary
+8. You receive a Telegram report; recruiter calls also drop a note into the career-ops agent inbox
 
 ---
 

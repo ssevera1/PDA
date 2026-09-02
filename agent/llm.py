@@ -47,7 +47,7 @@ class ClaudeProvider(BaseLLMProvider):
             timeout=_TIMEOUT_SECONDS,
             max_retries=_MAX_RETRIES,
         )
-        self._model = model or "claude-sonnet-4-6"
+        self._model = model or "claude-opus-5"
 
     def complete(self, system: str, messages: list[dict], max_tokens: int = 300) -> str:
         try:
@@ -60,7 +60,14 @@ class ClaudeProvider(BaseLLMProvider):
         except anthropic.APIError as exc:
             logger.warning(f"Claude completion failed ({self._model}): {exc!r}")
             raise
-        return response.content[0].text
+        # Claude Opus 5 thinks adaptively by default, so content may lead with
+        # thinking blocks — join the text blocks instead of trusting index 0.
+        text = "".join(
+            block.text for block in response.content if getattr(block, "type", "") == "text"
+        )
+        if not text:
+            raise RuntimeError(f"Claude returned no text blocks (stop_reason={response.stop_reason})")
+        return text
 
 
 # ---------------------------------------------------------------------------

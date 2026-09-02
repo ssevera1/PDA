@@ -14,3 +14,8 @@ build/
 *.egg
 *.whl
 data/*.jsonl
+data/knowledge.md
+data/google-token.json
+data/google-client-secret.json
+data/ms-token.json
+data/automation-logs/
